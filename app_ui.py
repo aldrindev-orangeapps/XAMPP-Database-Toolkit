@@ -12,7 +12,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, simpledialog, ttk
 
-from checkpoints import CheckpointStore
+from checkpoints import CheckpointStore, checkpoint_key
 from importer import ResumableImporter
 from local_auth import AuthError, LocalAuth
 from mysql_service import MySQLConfig, MySQLService, SYSTEM_DATABASES
@@ -573,15 +573,16 @@ class ModernApp:
         body.pack(fill="both", expand=True, padx=28, pady=24)
         ttk.Label(body, text="Data sanitizer", style="Title.TLabel").pack(anchor="w")
         ttk.Label(body, text="Find exact email, phone, and password columns, then replace their values.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
-        card = self._card(body, "Detected columns", "Only exact column-name matches are shown.")
-        card.pack(fill="both", expand=True)
-        top = ttk.Frame(card, style="Card.TFrame")
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Label(top, textvariable=self.sanitize_status, style="Muted.TLabel").pack(side="left")
-        self.scan_sanitize_button = ttk.Button(top, text="Scan database", style="Primary.TButton", command=self.scan_columns)
-        self.scan_sanitize_button.pack(side="right")
-        match_fields = ttk.Frame(card, style="Card.TFrame")
-        match_fields.pack(fill="x", pady=(0, 12))
+        exact_card = self._card(
+            body,
+            "Exact column names to find",
+            "Enter one exact column name for each data type. Partial matches are excluded.",
+            padding=16,
+            subtitle_gap=10,
+        )
+        exact_card.pack(fill="x")
+        match_fields = ttk.Frame(exact_card, style="Card.TFrame")
+        match_fields.pack(fill="x")
         for column in range(3):
             match_fields.columnconfigure(column, weight=1)
         for column, (label, variable) in enumerate((
@@ -593,6 +594,13 @@ class ModernApp:
             group.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0 if column == 2 else 6))
             ttk.Label(group, text=label, style="Muted.TLabel").pack(anchor="w")
             ttk.Entry(group, textvariable=variable).pack(fill="x", pady=(4, 0))
+        card = self._card(body, "Detected columns", "Only exact column-name matches are shown.")
+        card.pack(fill="both", expand=True, pady=(14, 0))
+        top = ttk.Frame(card, style="Card.TFrame")
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, textvariable=self.sanitize_status, style="Muted.TLabel").pack(side="left")
+        self.scan_sanitize_button = ttk.Button(top, text="Scan database", style="Primary.TButton", command=self.scan_columns)
+        self.scan_sanitize_button.pack(side="right")
         self.sanitize_list = tk.Listbox(card, selectmode="extended", exportselection=False, bg=SURFACE, fg=TEXT,
                                         bd=0, highlightthickness=1, highlightbackground=BORDER, selectbackground="#E0E7FF",
                                         selectforeground=TEXT, font=(self.font_family, 9), activestyle="none")
@@ -859,6 +867,9 @@ class ModernApp:
         self._thread(worker)
 
     def delete_database(self):
+        if self.importer:
+            self._alert("Import in progress", "Stop the active import before deleting a database.", True)
+            return
         name = self.selected_db.get()
         if not name:
             self._alert("No database", "Select a database first.")
@@ -872,17 +883,27 @@ class ModernApp:
                 self._alert("Name did not match", "The database was not deleted.")
             return
         self._sync_config()
+        config = self._mysql_config()
         self._set_database_busy(True, f"Deleting {name}…")
         def worker():
             try:
                 self.service.run(["-e", f"DROP DATABASE `{name}`;"])
-                self.log(f"Deleted database: {name}")
-                self._ui(self._delete_database_finished, name, None)
             except Exception as exc:
-                self._ui(self._delete_database_finished, name, str(exc))
+                self._ui(self._delete_database_finished, name, str(exc), 0, None)
+                return
+            removed, checkpoint_warning = 0, None
+            try:
+                removed = self.checkpoints.remove_for_database(config.host, config.port, name)
+            except Exception as exc:
+                checkpoint_warning = str(exc)
+                self.log(f"Database deleted, but its checkpoint could not be removed: {exc}")
+            self.log(f"Deleted database: {name}")
+            if removed:
+                self.log(f"Removed {removed} stale import checkpoint(s) for {name}.")
+            self._ui(self._delete_database_finished, name, None, removed, checkpoint_warning)
         self._thread(worker)
 
-    def _delete_database_finished(self, name, error):
+    def _delete_database_finished(self, name, error, removed_checkpoints=0, checkpoint_warning=None):
         if error:
             self._set_database_busy(False, "Delete failed")
             self._alert("Delete failed", error, True)
@@ -891,7 +912,13 @@ class ModernApp:
         self.selected_db.set(self.databases[0] if self.databases else "")
         self._filter_databases()
         self._set_database_busy(False, f"Deleted {name}")
-        self._alert("Database deleted", f"{name} was deleted successfully.")
+        checkpoint_note = (
+            f"\n\nRemoved {removed_checkpoints} saved import checkpoint(s). The next import will start fresh."
+            if removed_checkpoints else ""
+        )
+        if checkpoint_warning:
+            checkpoint_note += "\n\nThe saved checkpoint could not be cleared. Choose Start fresh when importing again."
+        self._alert("Database deleted", f"{name} was deleted successfully.{checkpoint_note}")
         self.refresh_databases()
 
     def start_import(self):
@@ -902,6 +929,29 @@ class ModernApp:
         if not self._confirm("Confirm import", f"Import\n{path}\n\ninto database\n{database}?"):
             return
         self._sync_config()
+        config = self._mysql_config()
+        import_key = checkpoint_key(path, config.host, config.port, database)
+        saved_checkpoint = self.checkpoints.get(import_key)
+        if saved_checkpoint and saved_checkpoint.offset > 0:
+            file_size = max(1, os.path.getsize(path))
+            percent = min(100, saved_checkpoint.offset / file_size * 100)
+            choice = self._dialog(
+                "Existing import checkpoint",
+                (f"A saved checkpoint exists at {percent:.1f}% ({self._format_bytes(saved_checkpoint.offset)}).\n\n"
+                 "Resume only if this database still contains the previously imported tables and rows. "
+                 "Choose Start fresh after deleting or recreating the database."),
+                [
+                    ("Cancel", "cancel", "TButton"),
+                    ("Start fresh", "fresh", "Danger.TButton"),
+                    ("Resume", "resume", "Primary.TButton"),
+                ],
+                True,
+            )
+            if not choice or choice == "cancel":
+                return
+            if choice == "fresh":
+                self.checkpoints.remove(import_key)
+                self.log(f"Discarded the saved checkpoint for {database}; starting from byte 0.")
         continue_on_error = self.continue_on_error.get()
         self.import_cancel.clear()
         self.import_started = time.monotonic()

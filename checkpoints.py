@@ -179,3 +179,19 @@ class CheckpointStore:
             self._append({"op": "remove", "key": key})
             del data[key]
             self._compact()
+
+    def remove_for_database(self, host: str, port: str, database: str) -> int:
+        """Remove every checkpoint tied to a deleted database target."""
+        data = self._load()
+        matches = [
+            key for key, checkpoint in data.items()
+            if str(checkpoint.get("host", "")).lower() == host.lower()
+            and str(checkpoint.get("port", "")) == str(port)
+            and str(checkpoint.get("database", "")).lower() == database.lower()
+        ]
+        for key in matches:
+            self._append({"op": "remove", "key": key})
+            del data[key]
+        if matches:
+            self._compact()
+        return len(matches)

@@ -59,6 +59,8 @@ Checkpoints are stored under `~/.xampp_sql_importer`. Confirmed offsets use a li
 
 Critical mysqldump session settings—including foreign-key checks, unique checks, SQL mode, and time zone—are pinned in the checkpoint and restored after reopening or reconnecting. Older checkpoints recover these settings from the dump preamble before resuming.
 
+When a checkpoint already exists, the app asks whether to **Resume**, **Start fresh**, or **Cancel**. Deleting a database through the app also removes checkpoints tied to that server and database so a recreated database cannot accidentally resume from a stale offset.
+
 The parser supports standard phpMyAdmin/mysqldump schema and data exports, including comments, quoted semicolons, multiline statements, and transactions. Scripts using custom `DELIMITER` blocks, stored procedures, functions, or triggers are rejected because arbitrary resume points are unsafe for them.
 
 ## Local administrator login

@@ -63,6 +63,22 @@ class CheckpointStoreTests(unittest.TestCase):
             store.remove("test-key")
             self.assertIsNone(CheckpointStore(directory).get("test-key"))
 
+    def test_database_deletion_removes_only_matching_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            first = make_checkpoint(100)
+            second = make_checkpoint(200)
+            second.key = "other-key"
+            second.database = "other_database"
+            store.save(first)
+            store.save(second)
+
+            removed = store.remove_for_database("127.0.0.1", "3306", "sample")
+            self.assertEqual(1, removed)
+            self.assertIsNone(store.get("test-key"))
+            self.assertIsNotNone(store.get("other-key"))
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
