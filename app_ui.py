@@ -63,6 +63,7 @@ class ModernApp:
         root.geometry("1120x740")
         root.minsize(960, 640)
         root.configure(bg=BG)
+        self._set_window_icon()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.mysql_path, self.host, self.port = tk.StringVar(), tk.StringVar(value="127.0.0.1"), tk.StringVar(value="3306")
@@ -96,6 +97,21 @@ class ModernApp:
         root.bind_all("<KeyPress>", self._record_activity, add="+")
         root.bind_all("<ButtonPress>", self._record_activity, add="+")
         root.after(30_000, self._check_idle_logout)
+
+    def _set_window_icon(self):
+        ico_path = resource_path(os.path.join("assets", "icons", "app-icon.ico"))
+        png_path = resource_path(os.path.join("assets", "icons", "app-icon.png"))
+        try:
+            if os.path.isfile(ico_path):
+                self.root.iconbitmap(default=ico_path)
+        except tk.TclError:
+            pass
+        try:
+            if os.path.isfile(png_path):
+                self.app_icon_image = tk.PhotoImage(file=png_path)
+                self.root.iconphoto(True, self.app_icon_image)
+        except tk.TclError:
+            self.app_icon_image = None
 
     def _configure_style(self):
         named = ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont", "TkHeadingFont",
@@ -155,7 +171,7 @@ class ModernApp:
                  bg=SURFACE, fg=TEXT, font=(self.font_family, 20, "bold")).pack(anchor="w", pady=(8, 4))
         description = ("Enter the local administrator password to continue."
                        if configured else
-                       "Create one administrator password. Only its salted hash will be stored locally.")
+                       "Create one administrator password.")
         tk.Label(card, text=description, bg=SURFACE, fg=MUTED, justify="left", wraplength=350,
                  font=(self.font_family, 9)).pack(anchor="w", pady=(0, 22))
 
@@ -163,8 +179,21 @@ class ModernApp:
         self.auth_confirm = tk.StringVar()
         tk.Label(card, text="Administrator password", bg=SURFACE, fg=MUTED,
                  font=(self.font_family, 9)).pack(anchor="w")
-        password_entry = ttk.Entry(card, textvariable=self.auth_password, show="•")
-        password_entry.pack(fill="x", pady=(6, 13))
+        password_row = tk.Frame(card, bg=SURFACE)
+        password_row.pack(fill="x", pady=(6, 13))
+        self.auth_password_visible = False
+        password_entry = ttk.Entry(password_row, textvariable=self.auth_password, show="•")
+        password_entry.pack(side="left", fill="x", expand=True)
+        password_toggle = tk.Canvas(
+            password_row, width=34, height=34, bg="#FAFBFC", highlightthickness=1,
+            highlightbackground=BORDER, cursor="hand2",
+        )
+        password_toggle.pack(side="right", padx=(6, 0))
+        password_toggle.bind(
+            "<Button-1>",
+            lambda _event: self._toggle_auth_password(password_entry, password_toggle),
+        )
+        self._draw_password_icon(password_toggle, visible=False)
         if not configured:
             tk.Label(card, text="Confirm password", bg=SURFACE, fg=MUTED,
                      font=(self.font_family, 9)).pack(anchor="w")
@@ -185,6 +214,22 @@ class ModernApp:
             tk.Label(card, text="Minimum 8 characters", bg=SURFACE, fg=MUTED,
                      font=(self.font_family, 8)).pack(anchor="center", pady=(12, 0))
         password_entry.focus_set()
+
+    def _draw_password_icon(self, canvas, visible):
+        canvas.delete("all")
+        color = PRIMARY if visible else MUTED
+        canvas.create_arc(5, 8, 29, 26, start=20, extent=140, style="arc", width=2, outline=color)
+        canvas.create_arc(5, 8, 29, 26, start=200, extent=140, style="arc", width=2, outline=color)
+        canvas.create_oval(14, 14, 20, 20, fill=color, outline=color)
+        if visible:
+            canvas.create_line(7, 27, 28, 6, fill=DANGER, width=2)
+
+    def _toggle_auth_password(self, entry, canvas):
+        self.auth_password_visible = not self.auth_password_visible
+        entry.configure(show="" if self.auth_password_visible else "•")
+        self._draw_password_icon(canvas, self.auth_password_visible)
+        entry.focus_set()
+        entry.icursor("end")
 
     def _submit_auth(self):
         password = self.auth_password.get()
@@ -939,6 +984,13 @@ class ModernApp:
 
 
 def run_app():
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "AldrinCaballero.XAMMPSQLImporter"
+            )
+        except (AttributeError, OSError):
+            pass
     root = tk.Tk()
     ModernApp(root)
     root.mainloop()

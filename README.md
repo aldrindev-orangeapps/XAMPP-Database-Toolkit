@@ -13,6 +13,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Email and phone column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
 - Single-administrator login, logout, failed-attempt lockout, and idle auto-lock
+- Original database-import security icon for the window, taskbar, and EXE
 - Poppins Regular, Medium, and SemiBold bundled into the standalone EXE
 
 ## Requirements
