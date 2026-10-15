@@ -54,6 +54,9 @@ python -m PyInstaller --onefile --windowed --name "XAMPP Database Toolkit" --ico
 3. Progress advances only after MySQL acknowledges a complete SQL statement.
 4. Safe connection failures are retried five times with increasing delays.
 5. If a non-transactional statement may have committed during a disconnect, the app asks whether to retry, skip, or stop. It never silently risks duplicating data.
+6. Cancel, logout, and window close wait for the current statement acknowledgement before saving the checkpoint and stopping. For a very large statement, keep the app open while this safe stop finishes.
+
+If the first statement after a resume reports duplicate-key error 1062, the app treats it as an uncertain previously committed statement. It asks whether to preserve the checkpoint and stop or explicitly assume that statement already executed and continue; it is never skipped silently.
 
 Checkpoints are stored under `~/.xampp_sql_importer`. Confirmed offsets use a lightweight append-only journal and are periodically compacted into `checkpoints.json`; this preserves statement-level recovery without rewriting the complete checkpoint file after every statement. A checkpoint is accepted only when the file path, size, modification time, server, port, and database match. Successful imports remove their checkpoint.
 
@@ -79,7 +82,7 @@ This local login protects against casual access to the application. The Windows 
 
 - **Delete selected** requires the exact database name. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
-- **Sanitizer** provides editable email, phone, and password column-name fields. Only exact case-insensitive matches are listed and updated. Replacements are permanent, so retain the original dump.
+- **Sanitizer** accepts multiple comma-separated column names for email, phone, and password (for example, `email, email_address, work_email`). Only exact full-name, case-insensitive matches are listed and updated, and every match in a category receives that category's single replacement value. Replacements are permanent, so retain the original dump.
 - Detected password columns can be reset across every row to `c4ca4238a0b923820dcc509a6f75849b`, whose default login value is `1`.
 
 ## Settings and security

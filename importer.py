@@ -75,6 +75,11 @@ def merge_session_sql(preamble: list[str], saved: list[str]) -> list[str]:
     return merged
 
 
+def is_duplicate_key_error(message: str) -> bool:
+    """Return whether mysql reported duplicate-key error 1062."""
+    return bool(re.search(r"\bERROR\s+1062\b", message, re.IGNORECASE))
+
+
 class ImportCancelled(RuntimeError):
     pass
 
@@ -141,7 +146,7 @@ class ResumableImporter:
         checkpoints: CheckpointStore,
         progress: Callable[[int, int, int, str], None],
         log: Callable[[str], None],
-        ambiguous: Callable[[str, int], str],
+        ambiguous: Callable[[str, int, str], str],
         cancelled: threading.Event,
     ):
         self.service = service
@@ -153,9 +158,13 @@ class ResumableImporter:
         self.client: _Client | None = None
 
     def cancel(self):
+        """Request a stop at the next confirmed statement boundary.
+
+        Do not kill mysql.exe here. The statement currently in flight may have
+        committed already; waiting for its acknowledgement lets us persist the
+        correct checkpoint and avoids replaying it on resume.
+        """
         self.cancelled.set()
-        if self.client:
-            self.client.stop()
 
     def _connect(self, database: str, force: bool, session_sql: list[str], announce=True) -> _Client:
         delays = [0, 1, 2, 4, 8, 16]
@@ -194,8 +203,6 @@ class ResumableImporter:
         else:
             statement.stream.seek(0)
             while True:
-                if self.cancelled.is_set():
-                    raise ImportCancelled()
                 chunk = statement.stream.read(1024 * 1024)
                 if not chunk:
                     break
@@ -204,8 +211,6 @@ class ResumableImporter:
         stdin.flush()
 
         while True:
-            if self.cancelled.is_set():
-                raise ImportCancelled()
             try:
                 line = self.client.stdout.get(timeout=0.2)
             except queue.Empty:
@@ -245,6 +250,7 @@ class ResumableImporter:
         key = checkpoint_key(path, cfg.host, cfg.port, database)
         saved = self.checkpoints.get(key)
         offset = saved.offset if saved else 0
+        resumed_from_checkpoint = offset > 0
         session_sql = list(saved.session_sql or []) if saved else []
         if offset:
             self.log(f"Resuming from confirmed checkpoint at byte {offset:,} ({offset / size * 100:.1f}%).")
@@ -276,9 +282,10 @@ class ResumableImporter:
                 yielded = False
                 for statement in iter_sql_statements(path, offset):
                     yielded = True
-                    statement_number += 1
                     if self.cancelled.is_set():
+                        statement.close()
                         raise ImportCancelled()
+                    statement_number += 1
 
                     keyword = statement.keyword
                     normalized_preview = re.sub(r"\s+", "", statement.preview).lower()
@@ -315,7 +322,7 @@ class ResumableImporter:
                             in_transaction = False
                             self._connect(database, continue_on_error, session_sql)
                         else:
-                            choice = self.ambiguous(statement.preview, statement_number)
+                            choice = self.ambiguous(statement.preview, statement_number, "connection_lost")
                             if choice == "retry":
                                 restart_from = statement.start
                                 self._connect(database, continue_on_error, session_sql)
@@ -329,16 +336,54 @@ class ResumableImporter:
                                 raise ImportCancelled()
                         statement.close()
                         break
-                    except SqlImportError:
+                    except SqlImportError as exc:
+                        if (
+                            resumed_from_checkpoint
+                            and statement_number == 1
+                            and is_duplicate_key_error(str(exc))
+                        ):
+                            choice = self.ambiguous(
+                                statement.preview, statement_number, "duplicate_on_resume"
+                            )
+                            if choice == "skip":
+                                offset = statement.end
+                                checkpoint.offset = offset
+                                self.checkpoints.save(checkpoint)
+                                statement.close()
+                                if self.client:
+                                    self.client.stop()
+                                self._connect(database, continue_on_error, session_sql)
+                                restart_from = offset
+                                break
+                            statement.close()
+                            raise ImportCancelled()
                         statement.close()
                         raise
 
                     if statement_errors:
-                        errors += 1
-                        self.log(f"Statement {statement_number} reported an error:\n{statement_errors}")
-                        if not continue_on_error:
-                            statement.close()
-                            raise SqlImportError(statement_errors)
+                        if (
+                            resumed_from_checkpoint
+                            and statement_number == 1
+                            and is_duplicate_key_error(statement_errors)
+                        ):
+                            choice = self.ambiguous(
+                                statement.preview, statement_number, "duplicate_on_resume"
+                            )
+                            if choice == "skip":
+                                self.log(
+                                    "The first resumed statement was marked as already executed; "
+                                    "its checkpoint is now confirmed."
+                                )
+                                statement_errors = ""
+                            else:
+                                statement.close()
+                                raise ImportCancelled()
+                        else:
+                            errors += 1
+                            self.log(f"Statement {statement_number} reported an error:\n{statement_errors}")
+                            if not continue_on_error:
+                                statement.close()
+                                raise SqlImportError(statement_errors)
 
                     if keyword == "SET" and statement.size <= 64 * 1024:
                         statement.stream.seek(0)

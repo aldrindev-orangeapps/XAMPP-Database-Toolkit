@@ -33,19 +33,32 @@ SUCCESS, DANGER = "#059669", "#DC2626"
 IDLE_LOGOUT_SECONDS = 15 * 60
 
 
+def parse_column_names(value: str) -> list[str]:
+    """Parse comma/newline-separated exact names, preserving order."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value.replace("\n", ",").split(","):
+        name = item.strip()
+        normalized = name.casefold()
+        if name and normalized not in seen:
+            names.append(name)
+            seen.add(normalized)
+    return names
+
+
 def sanitizer_kind(
     column: str,
     email_column: str = DEFAULT_EMAIL_COLUMN,
     phone_column: str = DEFAULT_PHONE_COLUMN,
     password_column: str = DEFAULT_PASSWORD_COLUMN,
 ) -> str | None:
-    lowered = column.lower()
-    for kind, exact_name in (
+    lowered = column.casefold()
+    for kind, configured_names in (
         ("password", password_column),
         ("email", email_column),
         ("phone", phone_column),
     ):
-        if exact_name.strip() and lowered == exact_name.strip().lower():
+        if lowered in {name.casefold() for name in parse_column_names(configured_names)}:
             return kind
     return None
 
@@ -106,6 +119,7 @@ class ModernApp:
         self.importer = None
         self.import_cancel = threading.Event()
         self.import_started = 0.0
+        self.after_import_action = None
         self.active_page = "Import"
         self.page_canvases = {}
         self.auth = LocalAuth()
@@ -299,11 +313,18 @@ class ModernApp:
                 return
             if not self._confirm(
                 "Import in progress",
-                "Logging out will stop the import at its last confirmed checkpoint. Continue?",
+                "The current statement will finish and be checkpointed before logout. Continue?",
                 True,
             ):
                 return
+            self.after_import_action = "logout"
+            self.import_status.set("Finishing current statement before logout…")
+            self.cancel_button.configure(state="disabled")
             self.importer.cancel()
+            return
+        self._finish_logout(automatic)
+
+    def _finish_logout(self, automatic=False):
         self.authenticated = False
         self.password.set("")
         self.selected_db.set("")
@@ -341,7 +362,7 @@ class ModernApp:
                                relief="flat", anchor="w", padx=24, pady=11, font=(self.font_family, 10), cursor="hand2")
             button.pack(fill="x", padx=10, pady=2)
             self.nav_buttons[page] = button
-        tk.Label(sidebar, text="NOT FOR SALE", bg=SIDEBAR, fg="#6B7280",
+        tk.Label(sidebar, text="THIS IS NOT FOR SALE", bg=SIDEBAR, fg="#6B7280",
                  justify="left", font=(self.font_family, 8)).pack(side="bottom", anchor="w", padx=24, pady=22)
 
         main = tk.Frame(self.app_shell, bg=BG)
@@ -572,29 +593,45 @@ class ModernApp:
         body = tk.Frame(page, bg=BG)
         body.pack(fill="both", expand=True, padx=28, pady=24)
         ttk.Label(body, text="Data sanitizer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text="Find exact email, phone, and password columns, then replace their values.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
+        ttk.Label(body, text="Find multiple exact email, phone, and password columns, then replace their values.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
         exact_card = self._card(
             body,
-            "Exact column names to find",
-            "Enter one exact column name for each data type. Partial matches are excluded.",
+            "Sanitizer rules",
+            "Enter one or more exact column names separated by commas. Partial matches are excluded.",
             padding=16,
             subtitle_gap=10,
         )
         exact_card.pack(fill="x")
-        match_fields = ttk.Frame(exact_card, style="Card.TFrame")
+        match_fields = tk.Frame(exact_card, bg=SURFACE)
         match_fields.pack(fill="x")
         for column in range(3):
             match_fields.columnconfigure(column, weight=1)
-        for column, (label, variable) in enumerate((
-            ("Exact email column", self.email_column_name),
-            ("Exact phone column", self.phone_column_name),
-            ("Exact password column", self.password_column_name),
+        for column, (title, variable, replacement, replacement_label, readonly) in enumerate((
+            ("Email", self.email_column_name, self.email_replacement, "Replacement email", False),
+            ("Phone number", self.phone_column_name, self.phone_replacement, "Replacement phone number", False),
+            ("Password", self.password_column_name, self.password_replacement, "Replacement password (login: 1)", True),
         )):
-            group = ttk.Frame(match_fields, style="Card.TFrame")
-            group.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0 if column == 2 else 6))
-            ttk.Label(group, text=label, style="Muted.TLabel").pack(anchor="w")
-            ttk.Entry(group, textvariable=variable).pack(fill="x", pady=(4, 0))
-        card = self._card(body, "Detected columns", "Only exact column-name matches are shown.")
+            group = tk.Frame(
+                match_fields, bg="#F9FAFB", padx=14, pady=12,
+                highlightthickness=1, highlightbackground=BORDER,
+            )
+            group.grid(
+                row=0, column=column, sticky="nsew",
+                padx=(0 if column == 0 else 6, 0 if column == 2 else 6),
+            )
+            tk.Label(group, text=title, bg="#F9FAFB", fg=TEXT,
+                     font=(self.font_family, 10, "bold"), anchor="w").pack(fill="x")
+            tk.Label(group, text="Exact column names (comma-separated)", bg="#F9FAFB", fg=MUTED,
+                     font=(self.font_family, 8), anchor="w").pack(fill="x", pady=(9, 3))
+            ttk.Entry(group, textvariable=variable).pack(fill="x")
+            tk.Label(group, text=replacement_label, bg="#F9FAFB", fg=MUTED,
+                     font=(self.font_family, 8), anchor="w").pack(fill="x", pady=(10, 3))
+            ttk.Entry(
+                group, textvariable=replacement,
+                state="readonly" if readonly else "normal",
+            ).pack(fill="x")
+
+        card = self._card(body, "Detected columns", "Exact full-name matches are selected automatically.")
         card.pack(fill="both", expand=True, pady=(14, 0))
         top = ttk.Frame(card, style="Card.TFrame")
         top.pack(fill="x", pady=(0, 10))
@@ -605,22 +642,12 @@ class ModernApp:
                                         bd=0, highlightthickness=1, highlightbackground=BORDER, selectbackground="#E0E7FF",
                                         selectforeground=TEXT, font=(self.font_family, 9), activestyle="none")
         self.sanitize_list.pack(fill="both", expand=True)
-        fields = ttk.Frame(card, style="Card.TFrame")
-        fields.pack(fill="x", pady=(14, 0))
-        fields.columnconfigure(1, weight=1)
-        fields.columnconfigure(3, weight=1)
-        ttk.Label(fields, text="Replacement email", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 8))
-        ttk.Entry(fields, textvariable=self.email_replacement).grid(row=0, column=1, sticky="ew", padx=(0, 18))
-        ttk.Label(fields, text="Replacement phone", style="Muted.TLabel").grid(row=0, column=2, padx=(0, 8))
-        ttk.Entry(fields, textvariable=self.phone_replacement).grid(row=0, column=3, sticky="ew")
-        ttk.Label(fields, text="Replacement password (login: 1)", style="Muted.TLabel").grid(
-            row=1, column=0, padx=(0, 8), pady=(10, 0)
-        )
-        ttk.Entry(fields, textvariable=self.password_replacement, state="readonly").grid(
-            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 18), pady=(10, 0)
-        )
-        self.sanitize_button = ttk.Button(fields, text="Replace selected", style="Danger.TButton", command=self.start_sanitize)
-        self.sanitize_button.grid(row=0, column=4, rowspan=2, padx=(14, 0))
+        actions = ttk.Frame(card, style="Card.TFrame")
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Label(actions, text="Review the selected columns before applying permanent replacements.",
+                  style="Muted.TLabel").pack(side="left")
+        self.sanitize_button = ttk.Button(actions, text="Replace selected", style="Danger.TButton", command=self.start_sanitize)
+        self.sanitize_button.pack(side="right")
 
     def _build_logs_page(self):
         page = self._new_page("Logs")
@@ -990,17 +1017,30 @@ class ModernApp:
                 self.import_status.set(status)
             self._ui(update)
 
-        def ambiguous(preview, number):
+        def ambiguous(preview, number, reason):
             answer, ready = {"value": "stop"}, threading.Event()
             def ask():
-                result = self._dialog(
-                    "Uncertain statement status",
-                    f"Connection was lost during statement {number}. MySQL may have committed it.\n\n{preview[:700]}",
-                    [("Stop and preserve", "stop", "TButton"),
-                     ("Assume executed", "skip", "TButton"),
-                     ("Retry statement", "retry", "Danger.TButton")],
-                    True,
-                )
+                if reason == "duplicate_on_resume":
+                    result = self._dialog(
+                        "Duplicate found after resume",
+                        ("The first resumed statement reported duplicate key error 1062. This usually "
+                         "means MySQL committed it before the previous app session closed, but its "
+                         "checkpoint was not saved.\n\nChoose Assume executed only if this is the same, "
+                         "partially imported database. If the database was recreated or changed, stop "
+                         "and start a fresh import.\n\n" + preview[:700]),
+                        [("Stop and preserve", "stop", "TButton"),
+                         ("Assume executed and continue", "skip", "Primary.TButton")],
+                        True,
+                    )
+                else:
+                    result = self._dialog(
+                        "Uncertain statement status",
+                        f"Connection was lost during statement {number}. MySQL may have committed it.\n\n{preview[:700]}",
+                        [("Stop and preserve", "stop", "TButton"),
+                         ("Assume executed", "skip", "TButton"),
+                         ("Retry statement", "retry", "Danger.TButton")],
+                        True,
+                    )
                 answer["value"] = result or "stop"
                 ready.set()
             self._ui(ask)
@@ -1014,13 +1054,23 @@ class ModernApp:
 
     def cancel_import(self):
         if self.importer:
-            self.import_status.set("Stopping safely…")
+            self.import_status.set("Finishing current statement safely…")
+            self.cancel_button.configure(state="disabled")
             self.importer.cancel()
 
     def _import_finished(self, result):
+        pending_action = self.after_import_action
+        self.after_import_action = None
         self.import_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self.importer = None
+        if pending_action == "close":
+            self.save_config(notify=False)
+            self.root.destroy()
+            return
+        if pending_action == "logout":
+            self._finish_logout()
+            return
         if result.success:
             self.import_progress["value"] = 100
             self.progress_percent.configure(text="100%")
@@ -1107,23 +1157,35 @@ class ModernApp:
         if not database:
             self._alert("No database", "Select a database first.")
             return
-        rules = [
-            ("email", self.email_column_name.get().strip()),
-            ("phone", self.phone_column_name.get().strip()),
-            ("password", self.password_column_name.get().strip()),
+        groups = [
+            ("email", parse_column_names(self.email_column_name.get())),
+            ("phone", parse_column_names(self.phone_column_name.get())),
+            ("password", parse_column_names(self.password_column_name.get())),
         ]
-        if any(not name for _, name in rules):
-            self._alert("Missing column name", "Enter the exact email, phone, and password column names.")
+        if any(not names for _, names in groups):
+            self._alert(
+                "Missing column name",
+                "Enter at least one exact column name for email, phone number, and password.",
+            )
             return
-        normalized_names = [name.lower() for _, name in rules]
-        if len(set(normalized_names)) != len(normalized_names):
-            self._alert("Duplicate column name", "Email, phone, and password column names must be different.")
-            return
+        kind_by_name = {}
+        for kind, names in groups:
+            for name in names:
+                normalized = name.casefold()
+                existing_kind = kind_by_name.get(normalized)
+                if existing_kind and existing_kind != kind:
+                    self._alert(
+                        "Duplicate column name",
+                        f'Column name "{name}" is assigned to both {existing_kind} and {kind}.',
+                    )
+                    return
+                kind_by_name[normalized] = kind
         self._sync_config()
         self.sanitize_status.set("Scanning…")
         self.scan_sanitize_button.configure(state="disabled", text="Scanning…")
-        sql_names = ", ".join(f"'{name.replace(chr(39), chr(39) * 2).lower()}'" for _, name in rules)
-        kind_by_name = {name.lower(): kind for kind, name in rules}
+        sql_names = ", ".join(
+            f"'{name.replace(chr(39), chr(39) * 2)}'" for name in kind_by_name
+        )
         query = ("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns "
                  f"WHERE TABLE_SCHEMA='{database.replace(chr(39), chr(39) * 2)}' "
                  f"AND LOWER(COLUMN_NAME) IN ({sql_names}) ORDER BY TABLE_NAME, COLUMN_NAME;")
@@ -1134,7 +1196,7 @@ class ModernApp:
                 for line in result.stdout.splitlines():
                     parts = line.split("\t")
                     if len(parts) == 2:
-                        kind = kind_by_name.get(parts[1].lower())
+                        kind = kind_by_name.get(parts[1].casefold())
                         if kind:
                             found.append((parts[0], parts[1], kind))
                 self._ui(self._show_sanitize_columns, found)
@@ -1229,10 +1291,19 @@ class ModernApp:
             self._alert("Settings saved", "Connection settings were saved. The password was not stored.")
 
     def on_close(self):
-        if self.importer and not self._confirm("Import in progress", "Stop the import and close the app?", True):
-            return
         if self.importer:
+            if not self._confirm(
+                "Import in progress",
+                "The current statement will finish and be checkpointed before the app closes. Continue?",
+                True,
+            ):
+                return
+            self.after_import_action = "close"
+            self.import_status.set("Finishing current statement before closing…")
+            self.cancel_button.configure(state="disabled")
             self.importer.cancel()
+            self.save_config(notify=False)
+            return
         self.save_config(notify=False)
         self.root.destroy()
 
