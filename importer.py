@@ -17,6 +17,64 @@ from mysql_service import CREATE_NO_WINDOW, MySQLError, MySQLService, is_connect
 from sql_parser import SqlStatement, UnsupportedSqlError, iter_sql_statements
 
 
+CRITICAL_SESSION_MARKERS = (
+    "FOREIGN_KEY_CHECKS",
+    "UNIQUE_CHECKS",
+    "SQL_MODE",
+    "TIME_ZONE",
+    "SQL_NOTES",
+    "SET NAMES",
+    "@OLD_CHARACTER_SET_CLIENT",
+    "@OLD_CHARACTER_SET_RESULTS",
+    "@OLD_COLLATION_CONNECTION",
+)
+
+
+def is_critical_session_sql(sql: str) -> bool:
+    normalized = re.sub(r"\s+", " ", sql).upper()
+    return any(marker in normalized for marker in CRITICAL_SESSION_MARKERS)
+
+
+def remember_session_sql(current: list[str], sql: str, recent_limit: int = 100) -> list[str]:
+    """Keep recent SET statements without evicting critical dump state."""
+    combined = current + [sql]
+    noncritical_indexes = [
+        index for index, statement in enumerate(combined)
+        if not is_critical_session_sql(statement)
+    ]
+    recent_noncritical = set(noncritical_indexes[-recent_limit:])
+    return [
+        statement for index, statement in enumerate(combined)
+        if is_critical_session_sql(statement) or index in recent_noncritical
+    ]
+
+
+def dump_preamble_session_sql(path: str, scan_limit: int = 1024 * 1024) -> list[str]:
+    """Recover critical mysqldump settings needed by older checkpoints."""
+    recovered: list[str] = []
+    for statement in iter_sql_statements(path):
+        try:
+            if statement.keyword == "SET" and statement.size <= 64 * 1024:
+                statement.stream.seek(0)
+                sql = statement.stream.read().decode("utf-8", "replace")
+                if is_critical_session_sql(sql):
+                    recovered.append(sql)
+            end = statement.end
+        finally:
+            statement.close()
+        if end >= scan_limit:
+            break
+    return recovered
+
+
+def merge_session_sql(preamble: list[str], saved: list[str]) -> list[str]:
+    merged = list(preamble)
+    for statement in saved:
+        if statement not in merged:
+            merged.append(statement)
+    return merged
+
+
 class ImportCancelled(RuntimeError):
     pass
 
@@ -162,7 +220,6 @@ class ResumableImporter:
                     raise BrokenPipeError(error)
                 raise SqlImportError(error)
             if line.decode("utf-8", "replace").strip() == marker:
-                time.sleep(0.02)
                 return self.client.errors()
 
     def _ensure_packet(self, required: int, current: int) -> int:
@@ -191,12 +248,17 @@ class ResumableImporter:
         session_sql = list(saved.session_sql or []) if saved else []
         if offset:
             self.log(f"Resuming from confirmed checkpoint at byte {offset:,} ({offset / size * 100:.1f}%).")
+            recovered = dump_preamble_session_sql(path)
+            session_sql = merge_session_sql(recovered, session_sql)
+            if recovered:
+                self.log("Recovered critical mysqldump session settings for safe resume.")
 
         stat = os.stat(path)
         checkpoint = ImportCheckpoint(
             key, os.path.abspath(path), stat.st_size, stat.st_mtime_ns,
             cfg.host, cfg.port, database, offset, session_sql,
         )
+        self.progress(offset, size, 0, "Preparing import")
         errors = 0
         statement_number = 0
         in_transaction = False
@@ -281,8 +343,7 @@ class ResumableImporter:
                     if keyword == "SET" and statement.size <= 64 * 1024:
                         statement.stream.seek(0)
                         sql = statement.stream.read().decode("utf-8", "replace")
-                        session_sql.append(sql)
-                        session_sql = session_sql[-100:]
+                        session_sql = remember_session_sql(session_sql, sql)
                         checkpoint.session_sql = session_sql
 
                     offset = statement.end

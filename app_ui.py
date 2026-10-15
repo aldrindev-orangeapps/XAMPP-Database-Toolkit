@@ -21,18 +21,40 @@ from sql_parser import is_read_only_sql, split_sql_text
 
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".xampp_sql_importer.ini")
 DEFAULT_MYSQL_PATHS = [r"C:\xampp\mysql\bin\mysql.exe", r"D:\xampp\mysql\bin\mysql.exe"]
-EMAIL_KEYWORDS = ["email"]
-PHONE_KEYWORDS = [
-    "phone", "mobile", "phone_number", "contact_number", "contactnumber", "contact_no",
-    "cellphone", "cell_number", "cellnumber", "telephone", "mobile_number", "mobilenumber",
-    "tel_no", "telno",
-]
+DEFAULT_EMAIL_COLUMN = "email"
+DEFAULT_PHONE_COLUMN = "phone"
+DEFAULT_PASSWORD_COLUMN = "password"
+DEFAULT_PASSWORD_HASH = "c4ca4238a0b923820dcc509a6f75849b"
 
 BG, SURFACE, SIDEBAR, SIDEBAR_HOVER = "#F5F7FB", "#FFFFFF", "#111827", "#1F2937"
 PRIMARY, PRIMARY_DARK = "#4F46E5", "#4338CA"
 TEXT, MUTED, BORDER = "#111827", "#6B7280", "#E5E7EB"
 SUCCESS, DANGER = "#059669", "#DC2626"
 IDLE_LOGOUT_SECONDS = 15 * 60
+
+
+def sanitizer_kind(
+    column: str,
+    email_column: str = DEFAULT_EMAIL_COLUMN,
+    phone_column: str = DEFAULT_PHONE_COLUMN,
+    password_column: str = DEFAULT_PASSWORD_COLUMN,
+) -> str | None:
+    lowered = column.lower()
+    for kind, exact_name in (
+        ("password", password_column),
+        ("email", email_column),
+        ("phone", phone_column),
+    ):
+        if exact_name.strip() and lowered == exact_name.strip().lower():
+            return kind
+    return None
+
+
+def build_sanitize_query(table: str, column: str, kind: str, value: str) -> str:
+    table_q, column_q = table.replace("`", "``"), column.replace("`", "``")
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    where = "" if kind == "password" else f" WHERE `{column_q}` IS NOT NULL AND `{column_q}`<>''"
+    return f"UPDATE `{table_q}` SET `{column_q}`='{escaped}'{where};"
 
 
 def resource_path(relative: str) -> str:
@@ -71,14 +93,21 @@ class ModernApp:
         self.selected_db, self.sql_file = tk.StringVar(), tk.StringVar()
         self.continue_on_error = tk.BooleanVar(value=True)
         self.connection_text, self.search_db = tk.StringVar(value="Not connected"), tk.StringVar()
+        self.database_status = tk.StringVar(value="Ready")
         self.import_status, self.import_detail = tk.StringVar(value="Ready to import"), tk.StringVar(value="Select a SQL dump to begin.")
         self.email_replacement, self.phone_replacement = tk.StringVar(value="test@example.com"), tk.StringVar(value="09170000000")
+        self.password_replacement = tk.StringVar(value=DEFAULT_PASSWORD_HASH)
+        self.email_column_name = tk.StringVar(value=DEFAULT_EMAIL_COLUMN)
+        self.phone_column_name = tk.StringVar(value=DEFAULT_PHONE_COLUMN)
+        self.password_column_name = tk.StringVar(value=DEFAULT_PASSWORD_COLUMN)
         self.query_status = tk.StringVar(value="Ready")
         self.sanitize_status = tk.StringVar(value="Scan a database to find personal data columns.")
         self.databases, self.sanitize_columns = [], []
         self.importer = None
         self.import_cancel = threading.Event()
         self.import_started = 0.0
+        self.active_page = "Import"
+        self.page_canvases = {}
         self.auth = LocalAuth()
         self.authenticated = False
         self.last_activity = time.monotonic()
@@ -96,6 +125,7 @@ class ModernApp:
         self._show_auth_screen()
         root.bind_all("<KeyPress>", self._record_activity, add="+")
         root.bind_all("<ButtonPress>", self._record_activity, add="+")
+        root.bind_all("<MouseWheel>", self._scroll_active_page, add="+")
         root.after(30_000, self._check_idle_logout)
 
     def _set_window_icon(self):
@@ -355,26 +385,60 @@ class ModernApp:
     def _new_page(self, name):
         page = tk.Frame(self.page_host, bg=BG)
         page.grid(row=0, column=0, sticky="nsew")
+        page.grid_rowconfigure(0, weight=1)
         page.grid_columnconfigure(0, weight=1)
-        self.pages[name] = page
-        return page
+        canvas = tk.Canvas(page, bg=BG, bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        content = tk.Frame(canvas, bg=BG)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
 
-    def _card(self, parent, title, subtitle=None):
-        card = ttk.Frame(parent, style="Card.TFrame", padding=22)
+        def resize_content(event):
+            canvas.itemconfigure(content_window, width=event.width)
+            canvas.itemconfigure(content_window, height=max(event.height, content.winfo_reqheight()))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def update_content(_event=None):
+            target_height = max(canvas.winfo_height(), content.winfo_reqheight())
+            canvas.itemconfigure(content_window, height=target_height)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", resize_content)
+        content.bind("<Configure>", update_content)
+        self.pages[name] = page
+        self.page_canvases[name] = canvas
+        return content
+
+    def _scroll_active_page(self, event):
+        if not self.authenticated or isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Treeview)):
+            return None
+        canvas = self.page_canvases.get(self.active_page)
+        if not canvas or not canvas.winfo_ismapped():
+            return None
+        region = canvas.bbox("all")
+        if not region or region[3] <= canvas.winfo_height():
+            return None
+        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _card(self, parent, title, subtitle=None, padding=22, subtitle_gap=16, spacer_height=10):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=padding)
         ttk.Label(card, text=title, style="Heading.TLabel").pack(anchor="w")
         if subtitle:
-            ttk.Label(card, text=subtitle, style="Muted.TLabel").pack(anchor="w", pady=(3, 16))
+            ttk.Label(card, text=subtitle, style="Muted.TLabel").pack(anchor="w", pady=(3, subtitle_gap))
         else:
-            ttk.Frame(card, style="Card.TFrame", height=10).pack()
+            ttk.Frame(card, style="Card.TFrame", height=spacer_height).pack()
         return card
 
     def _build_import_page(self):
         page = self._new_page("Import")
         body = tk.Frame(page, bg=BG)
-        body.pack(fill="both", expand=True, padx=28, pady=24)
+        body.pack(fill="both", expand=True, padx=28, pady=18)
         ttk.Label(body, text="Import large SQL dumps", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text="Checkpointed streaming keeps memory use low and preserves confirmed progress.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
-        card = self._card(body, "SQL dump", "Choose a standard phpMyAdmin or mysqldump file.")
+        ttk.Label(body, text="Checkpointed streaming keeps memory use low and preserves confirmed progress.", foreground=MUTED).pack(anchor="w", pady=(2, 12))
+        card = self._card(body, "SQL dump", "Choose a standard phpMyAdmin or mysqldump file.", padding=(16, 8), subtitle_gap=2)
         card.pack(fill="x")
         file_row = ttk.Frame(card, style="Card.TFrame")
         file_row.pack(fill="x")
@@ -382,26 +446,36 @@ class ModernApp:
         ttk.Entry(file_row, textvariable=self.sql_file).grid(row=0, column=0, sticky="ew", padx=(0, 10))
         ttk.Button(file_row, text="Browse file", command=self.browse_sql).grid(row=0, column=1)
         options = ttk.Frame(card, style="Card.TFrame")
-        options.pack(fill="x", pady=(14, 0))
+        options.pack(fill="x", pady=(4, 0))
         ttk.Checkbutton(options, text="Continue after ordinary SQL errors", variable=self.continue_on_error).pack(side="left")
         self.import_button = ttk.Button(options, text="Start import", style="Primary.TButton", command=self.start_import)
         self.import_button.pack(side="right")
         self.cancel_button = ttk.Button(options, text="Cancel", command=self.cancel_import, state="disabled")
         self.cancel_button.pack(side="right", padx=8)
-        progress = self._card(body, "Progress")
-        progress.pack(fill="x", pady=18)
+        progress = self._card(body, "Progress", padding=(16, 8), spacer_height=2)
+        progress.pack(fill="x", pady=8)
         top = ttk.Frame(progress, style="Card.TFrame")
         top.pack(fill="x")
         ttk.Label(top, textvariable=self.import_status, style="Card.TLabel", font=(self.font_family, 11, "bold")).pack(side="left")
         self.progress_percent = ttk.Label(top, text="0%", style="Card.TLabel")
         self.progress_percent.pack(side="right")
         self.import_progress = ttk.Progressbar(progress, mode="determinate")
-        self.import_progress.pack(fill="x", pady=(14, 9))
-        ttk.Label(progress, textvariable=self.import_detail, style="Muted.TLabel").pack(anchor="w")
-        note = self._card(body, "Safe recovery", "Progress advances only after MySQL confirms a complete statement.")
+        self.import_progress.pack(fill="x", pady=(6, 3))
+        self.import_detail_label = ttk.Label(
+            progress, textvariable=self.import_detail, style="Muted.TLabel", wraplength=620, justify="left"
+        )
+        self.import_detail_label.pack(anchor="w")
+        note = ttk.Frame(body, style="Card.TFrame", padding=(16, 12))
         note.pack(fill="x")
-        ttk.Label(note, text="If a connection drops at an uncertain commit point, the app pauses so you can avoid duplicate rows.",
-                  style="Card.TLabel", wraplength=750).pack(anchor="w")
+        self.safe_recovery_card = note
+        ttk.Label(note, text="Safe recovery", style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(
+            note,
+            text=("Progress advances only after MySQL confirms a complete statement. "
+                  "If a connection drops at an uncertain commit point, the app pauses so you can avoid duplicate rows."),
+            style="Card.TLabel",
+            wraplength=850,
+        ).pack(anchor="w", pady=(4, 0))
 
     def _build_databases_page(self):
         page = self._new_page("Databases")
@@ -409,35 +483,54 @@ class ModernApp:
         body.pack(fill="both", expand=True, padx=28, pady=24)
         ttk.Label(body, text="Databases & connection", style="Title.TLabel").pack(anchor="w")
         ttk.Label(body, text="Manage the server connection and choose the active database.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
-        conn = self._card(body, "Connection")
+        conn = ttk.Frame(body, style="Card.TFrame", padding=16)
         conn.pack(fill="x")
+        ttk.Label(conn, text="Connection", style="Heading.TLabel").pack(anchor="w")
         grid = ttk.Frame(conn, style="Card.TFrame")
-        grid.pack(fill="x")
-        grid.columnconfigure(1, weight=1)
-        grid.columnconfigure(3, weight=1)
-        fields = [("mysql.exe", self.mysql_path), ("Host", self.host), ("Port", self.port), ("User", self.user), ("Password", self.password)]
-        for index, (label, variable) in enumerate(fields):
-            row, pair = divmod(index, 2)
-            ttk.Label(grid, text=label, style="Muted.TLabel").grid(row=row, column=pair * 2, sticky="w", padx=(0, 8), pady=6)
-            ttk.Entry(grid, textvariable=variable, show="*" if label == "Password" else "").grid(row=row, column=pair * 2 + 1, sticky="ew", padx=(0, 18), pady=6)
-        ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=0, column=4, padx=(0, 8))
+        grid.pack(fill="x", pady=(10, 0))
+        for column in (1, 3, 5, 7):
+            grid.columnconfigure(column, weight=1)
+        ttk.Label(grid, text="mysql.exe", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(grid, textvariable=self.mysql_path).grid(row=0, column=1, columnspan=6, sticky="ew", padx=(0, 8), pady=4)
+        ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=0, column=7, sticky="e", pady=4)
+        compact_fields = (("Host", self.host, ""), ("Port", self.port, ""),
+                          ("User", self.user, ""), ("Password", self.password, "*"))
+        for index, (label, variable, mask) in enumerate(compact_fields):
+            column = index * 2
+            ttk.Label(grid, text=label, style="Muted.TLabel").grid(row=1, column=column, sticky="w", padx=(0, 6), pady=4)
+            ttk.Entry(grid, textvariable=variable, show=mask).grid(row=1, column=column + 1, sticky="ew", padx=(0, 12), pady=4)
         actions = ttk.Frame(conn, style="Card.TFrame")
-        actions.pack(fill="x", pady=(12, 0))
+        actions.pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Change app password", command=self.change_app_password).pack(side="left")
         ttk.Button(actions, text="Save settings", command=self.save_config).pack(side="right")
         ttk.Button(actions, text="Test connection", style="Primary.TButton", command=self.test_connection).pack(side="right", padx=8)
-        dbcard = self._card(body, "Available databases")
+        dbcard = ttk.Frame(body, style="Card.TFrame", padding=16)
         dbcard.pack(fill="both", expand=True, pady=(18, 0))
+        db_heading = ttk.Frame(dbcard, style="Card.TFrame")
+        db_heading.pack(fill="x", pady=(0, 10))
+        ttk.Label(db_heading, text="Available databases", style="Heading.TLabel").pack(side="left")
+        ttk.Label(db_heading, textvariable=self.database_status, style="Muted.TLabel").pack(side="right")
         toolbar = ttk.Frame(dbcard, style="Card.TFrame")
         toolbar.pack(fill="x", pady=(0, 10))
         ttk.Entry(toolbar, textvariable=self.search_db, width=32).pack(side="left")
         self.search_db.trace_add("write", lambda *_: self._filter_databases())
-        ttk.Button(toolbar, text="Refresh", command=self.refresh_databases).pack(side="left", padx=8)
-        ttk.Button(toolbar, text="New database", style="Primary.TButton", command=self.create_database).pack(side="right")
-        ttk.Button(toolbar, text="Delete selected", style="Danger.TButton", command=self.delete_database).pack(side="right", padx=8)
-        self.db_list = tk.Listbox(dbcard, bg=SURFACE, fg=TEXT, bd=0, highlightthickness=1, highlightbackground=BORDER,
-                                  selectbackground="#E0E7FF", selectforeground=TEXT, font=(self.font_family, 10), activestyle="none")
-        self.db_list.pack(fill="both", expand=True)
+        self.refresh_db_button = ttk.Button(toolbar, text="Refresh", command=self.refresh_databases)
+        self.refresh_db_button.pack(side="left", padx=8)
+        self.create_db_button = ttk.Button(toolbar, text="New database", style="Primary.TButton", command=self.create_database)
+        self.create_db_button.pack(side="right")
+        self.delete_db_button = ttk.Button(toolbar, text="Delete selected", style="Danger.TButton", command=self.delete_database)
+        self.delete_db_button.pack(side="right", padx=8)
+        self.database_busy_bar = ttk.Progressbar(dbcard, mode="indeterminate")
+        list_wrap = ttk.Frame(dbcard, style="Card.TFrame")
+        list_wrap.pack(fill="both", expand=True)
+        self.db_list_wrap = list_wrap
+        self.db_list = tk.Listbox(list_wrap, height=8, bg=SURFACE, fg=TEXT, bd=0, highlightthickness=1,
+                                  highlightbackground=BORDER, selectbackground="#E0E7FF", selectforeground=TEXT,
+                                  font=(self.font_family, 10), activestyle="none",
+                                  yscrollcommand=lambda first, last: db_scroll.set(first, last))
+        db_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.db_list.yview)
+        self.db_list.pack(side="left", fill="both", expand=True)
+        db_scroll.pack(side="right", fill="y", padx=(6, 0))
         self.db_list.bind("<<ListboxSelect>>", self._select_database)
 
     def _build_query_page(self):
@@ -450,15 +543,17 @@ class ModernApp:
         ttk.Label(body, text="SQL Console", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         editor = self._card(body, "Query editor", "Run selected text, or the entire editor when nothing is selected.")
         editor.grid(row=1, column=0, sticky="nsew", pady=(16, 10))
+        actions = ttk.Frame(editor, style="Card.TFrame")
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Label(actions, textvariable=self.query_status, style="Muted.TLabel").pack(side="left")
+        ttk.Label(actions, text="Ctrl+Enter", style="Muted.TLabel").pack(side="right", padx=(0, 10))
+        self.run_query_button = ttk.Button(actions, text="Execute SQL", style="Primary.TButton", command=self.run_query)
+        self.run_query_button.pack(side="right")
         self.query_editor = tk.Text(editor, height=8, wrap="none", undo=True, bg="#FBFCFE", fg=TEXT,
                                     insertbackground=TEXT, bd=0, highlightthickness=1, highlightbackground=BORDER,
                                     font=(self.font_family, 10), padx=12, pady=12)
         self.query_editor.pack(fill="both", expand=True)
-        actions = ttk.Frame(editor, style="Card.TFrame")
-        actions.pack(fill="x", pady=(10, 0))
-        ttk.Label(actions, textvariable=self.query_status, style="Muted.TLabel").pack(side="left")
-        self.run_query_button = ttk.Button(actions, text="Run query", style="Primary.TButton", command=self.run_query)
-        self.run_query_button.pack(side="right")
+        self.query_editor.bind("<Control-Return>", lambda _event: (self.run_query(), "break")[1])
         results = self._card(body, "Results")
         results.grid(row=2, column=0, sticky="nsew")
         wrap = ttk.Frame(results, style="Card.TFrame")
@@ -477,13 +572,27 @@ class ModernApp:
         body = tk.Frame(page, bg=BG)
         body.pack(fill="both", expand=True, padx=28, pady=24)
         ttk.Label(body, text="Data sanitizer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text="Find and replace email and phone values in the selected database.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
-        card = self._card(body, "Detected columns", "Select the columns you want to overwrite.")
+        ttk.Label(body, text="Find exact email, phone, and password columns, then replace their values.", foreground=MUTED).pack(anchor="w", pady=(2, 18))
+        card = self._card(body, "Detected columns", "Only exact column-name matches are shown.")
         card.pack(fill="both", expand=True)
         top = ttk.Frame(card, style="Card.TFrame")
         top.pack(fill="x", pady=(0, 10))
         ttk.Label(top, textvariable=self.sanitize_status, style="Muted.TLabel").pack(side="left")
-        ttk.Button(top, text="Scan database", style="Primary.TButton", command=self.scan_columns).pack(side="right")
+        self.scan_sanitize_button = ttk.Button(top, text="Scan database", style="Primary.TButton", command=self.scan_columns)
+        self.scan_sanitize_button.pack(side="right")
+        match_fields = ttk.Frame(card, style="Card.TFrame")
+        match_fields.pack(fill="x", pady=(0, 12))
+        for column in range(3):
+            match_fields.columnconfigure(column, weight=1)
+        for column, (label, variable) in enumerate((
+            ("Exact email column", self.email_column_name),
+            ("Exact phone column", self.phone_column_name),
+            ("Exact password column", self.password_column_name),
+        )):
+            group = ttk.Frame(match_fields, style="Card.TFrame")
+            group.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0 if column == 2 else 6))
+            ttk.Label(group, text=label, style="Muted.TLabel").pack(anchor="w")
+            ttk.Entry(group, textvariable=variable).pack(fill="x", pady=(4, 0))
         self.sanitize_list = tk.Listbox(card, selectmode="extended", exportselection=False, bg=SURFACE, fg=TEXT,
                                         bd=0, highlightthickness=1, highlightbackground=BORDER, selectbackground="#E0E7FF",
                                         selectforeground=TEXT, font=(self.font_family, 9), activestyle="none")
@@ -496,8 +605,14 @@ class ModernApp:
         ttk.Entry(fields, textvariable=self.email_replacement).grid(row=0, column=1, sticky="ew", padx=(0, 18))
         ttk.Label(fields, text="Replacement phone", style="Muted.TLabel").grid(row=0, column=2, padx=(0, 8))
         ttk.Entry(fields, textvariable=self.phone_replacement).grid(row=0, column=3, sticky="ew")
+        ttk.Label(fields, text="Replacement password (login: 1)", style="Muted.TLabel").grid(
+            row=1, column=0, padx=(0, 8), pady=(10, 0)
+        )
+        ttk.Entry(fields, textvariable=self.password_replacement, state="readonly").grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 18), pady=(10, 0)
+        )
         self.sanitize_button = ttk.Button(fields, text="Replace selected", style="Danger.TButton", command=self.start_sanitize)
-        self.sanitize_button.grid(row=0, column=4, padx=(14, 0))
+        self.sanitize_button.grid(row=0, column=4, rowspan=2, padx=(14, 0))
 
     def _build_logs_page(self):
         page = self._new_page("Logs")
@@ -515,6 +630,7 @@ class ModernApp:
 
     def show_page(self, name):
         self.pages[name].tkraise()
+        self.active_page = name
         self.page_title.configure(text=name)
         for page, button in self.nav_buttons.items():
             button.configure(bg=PRIMARY if page == name else SIDEBAR, fg="white" if page == name else "#D1D5DB",
@@ -656,6 +772,13 @@ class ModernApp:
                 return f"{number:.1f} {unit}"
             number /= 1024
 
+    @staticmethod
+    def _format_duration(value):
+        seconds = max(0, int(value))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
     def test_connection(self):
         self._sync_config()
         self.connection_text.set("Connecting…")
@@ -671,6 +794,7 @@ class ModernApp:
 
     def refresh_databases(self):
         self._sync_config()
+        self.database_status.set("Loading databases…")
         self.connection_text.set("Connecting…")
         def retry(attempt, delay):
             self._ui(self.connection_text.set, f"Retry {attempt}/5 in {delay}s")
@@ -679,13 +803,29 @@ class ModernApp:
                 self.databases = self.service.databases(retry_callback=retry)
                 self._ui(self._filter_databases)
                 self._ui(self._set_connection, True, "Connected")
+                self._ui(self.database_status.set, f"{len(self.databases)} database(s)")
                 if self.databases and self.selected_db.get() not in self.databases:
                     self._ui(self.selected_db.set, self.databases[0])
                 self.log(f"Loaded {len(self.databases)} database(s).")
             except Exception as exc:
                 self._ui(self._set_connection, False, "Connection failed")
+                self._ui(self.database_status.set, "Refresh failed")
                 self.log(f"Database refresh failed: {exc}")
         self._thread(worker)
+
+    def _set_database_busy(self, busy, message="Ready"):
+        state = "disabled" if busy else "normal"
+        self.refresh_db_button.configure(state=state)
+        self.create_db_button.configure(state=state)
+        self.delete_db_button.configure(state=state, text="Deleting…" if busy else "Delete selected")
+        self.db_list.configure(state=state)
+        self.database_status.set(message)
+        if busy:
+            self.database_busy_bar.pack(fill="x", pady=(0, 10), before=self.db_list_wrap)
+            self.database_busy_bar.start(12)
+        else:
+            self.database_busy_bar.stop()
+            self.database_busy_bar.pack_forget()
 
     def _filter_databases(self):
         query = self.search_db.get().strip().lower()
@@ -732,15 +872,27 @@ class ModernApp:
                 self._alert("Name did not match", "The database was not deleted.")
             return
         self._sync_config()
+        self._set_database_busy(True, f"Deleting {name}…")
         def worker():
             try:
                 self.service.run(["-e", f"DROP DATABASE `{name}`;"])
                 self.log(f"Deleted database: {name}")
-                self._ui(self.selected_db.set, "")
-                self._ui(self.refresh_databases)
+                self._ui(self._delete_database_finished, name, None)
             except Exception as exc:
-                self._ui(self._alert, "Delete failed", str(exc), True)
+                self._ui(self._delete_database_finished, name, str(exc))
         self._thread(worker)
+
+    def _delete_database_finished(self, name, error):
+        if error:
+            self._set_database_busy(False, "Delete failed")
+            self._alert("Delete failed", error, True)
+            return
+        self.databases = [database for database in self.databases if database != name]
+        self.selected_db.set(self.databases[0] if self.databases else "")
+        self._filter_databases()
+        self._set_database_busy(False, f"Deleted {name}")
+        self._alert("Database deleted", f"{name} was deleted successfully.")
+        self.refresh_databases()
 
     def start_import(self):
         path, database = self.sql_file.get(), self.selected_db.get()
@@ -757,15 +909,34 @@ class ModernApp:
         self.cancel_button.configure(state="normal")
         self.import_status.set("Preparing import…")
         self.import_progress["value"] = 0
+        last_progress_update = [0.0]
+        confirmed_at_start = [0]
 
         def progress(done, total, number, status):
+            now = time.monotonic()
+            # Keep statement-level confirmation while avoiding thousands of
+            # unnecessary Tk redraws for dumps made of small INSERTs.
+            if total and status == "Importing" and now - last_progress_update[0] < 0.1:
+                return
+            last_progress_update[0] = now
+            if total and number == 0:
+                confirmed_at_start[0] = done
+
             def update():
                 if total:
                     pct = min(100, done / total * 100)
                     self.import_progress["value"] = pct
                     self.progress_percent.configure(text=f"{pct:.1f}%")
-                    rate = done / max(0.01, time.monotonic() - self.import_started)
-                    self.import_detail.set(f"Confirmed {self._format_bytes(done)} of {self._format_bytes(total)} • {self._format_bytes(rate)}/s • statement {number:,}")
+                    elapsed = max(0.01, time.monotonic() - self.import_started)
+                    transferred = max(0, done - confirmed_at_start[0])
+                    rate = transferred / elapsed
+                    eta = (total - done) / rate if rate > 0 else None
+                    eta_text = self._format_duration(eta) if eta is not None else "calculating"
+                    self.import_detail.set(
+                        f"Confirmed {self._format_bytes(done)} of {self._format_bytes(total)} • "
+                        f"{self._format_bytes(rate)}/s • elapsed {self._format_duration(elapsed)} • "
+                        f"ETA {eta_text} • statement {number:,}"
+                    )
                 self.import_status.set(status)
             self._ui(update)
 
@@ -804,6 +975,7 @@ class ModernApp:
             self.import_progress["value"] = 100
             self.progress_percent.configure(text="100%")
             self.import_status.set("Import complete")
+            self.import_detail.set(f"Completed in {self._format_duration(time.monotonic() - self.import_started)}.")
             self.log(f"Import completed with {result.errors} SQL error(s).")
             self._alert("Import complete", f"Finished with {result.errors} SQL error(s). See Logs." if result.errors else "The SQL dump was imported successfully.")
         elif result.cancelled:
@@ -885,11 +1057,26 @@ class ModernApp:
         if not database:
             self._alert("No database", "Select a database first.")
             return
+        rules = [
+            ("email", self.email_column_name.get().strip()),
+            ("phone", self.phone_column_name.get().strip()),
+            ("password", self.password_column_name.get().strip()),
+        ]
+        if any(not name for _, name in rules):
+            self._alert("Missing column name", "Enter the exact email, phone, and password column names.")
+            return
+        normalized_names = [name.lower() for _, name in rules]
+        if len(set(normalized_names)) != len(normalized_names):
+            self._alert("Duplicate column name", "Email, phone, and password column names must be different.")
+            return
         self._sync_config()
         self.sanitize_status.set("Scanning…")
-        clauses = " OR ".join(f"LOWER(COLUMN_NAME) LIKE '%{word}%'" for word in EMAIL_KEYWORDS + PHONE_KEYWORDS)
+        self.scan_sanitize_button.configure(state="disabled", text="Scanning…")
+        sql_names = ", ".join(f"'{name.replace(chr(39), chr(39) * 2).lower()}'" for _, name in rules)
+        kind_by_name = {name.lower(): kind for kind, name in rules}
         query = ("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns "
-                 f"WHERE TABLE_SCHEMA='{database.replace(chr(39), chr(39) * 2)}' AND ({clauses}) ORDER BY TABLE_NAME, COLUMN_NAME;")
+                 f"WHERE TABLE_SCHEMA='{database.replace(chr(39), chr(39) * 2)}' "
+                 f"AND LOWER(COLUMN_NAME) IN ({sql_names}) ORDER BY TABLE_NAME, COLUMN_NAME;")
         def worker():
             try:
                 result = self.service.run(["-N", "-B", "-e", query], timeout=45, safe_retry=True)
@@ -897,15 +1084,18 @@ class ModernApp:
                 for line in result.stdout.splitlines():
                     parts = line.split("\t")
                     if len(parts) == 2:
-                        kind = "email" if any(word in parts[1].lower() for word in EMAIL_KEYWORDS) else "phone"
-                        found.append((parts[0], parts[1], kind))
+                        kind = kind_by_name.get(parts[1].lower())
+                        if kind:
+                            found.append((parts[0], parts[1], kind))
                 self._ui(self._show_sanitize_columns, found)
             except Exception as exc:
                 self._ui(self.sanitize_status.set, "Scan failed — see Logs")
+                self._ui(self._sanitize_scan_failed, str(exc))
                 self.log(f"Sanitizer scan failed: {exc}")
         self._thread(worker)
 
     def _show_sanitize_columns(self, found):
+        self.scan_sanitize_button.configure(state="normal", text="Scan database")
         self.sanitize_columns = found
         self.sanitize_list.delete(0, "end")
         for table, column, kind in found:
@@ -914,26 +1104,40 @@ class ModernApp:
             self.sanitize_list.selection_set(0, "end")
         self.sanitize_status.set(f"Found {len(found)} matching column(s).")
 
+    def _sanitize_scan_failed(self, error):
+        self.scan_sanitize_button.configure(state="normal", text="Scan database")
+        self.sanitize_status.set("Scan failed — see Logs")
+        self._alert("Sanitizer scan failed", error, True)
+
     def start_sanitize(self):
         selected = [self.sanitize_columns[index] for index in self.sanitize_list.curselection()]
         database = self.selected_db.get()
         if not selected or not database:
             self._alert("Nothing selected", "Scan and select at least one column first.")
             return
-        if not self._confirm("Confirm permanent replacement", f"Permanently replace values in {len(selected)} column(s) in {database}?", True):
+        password_count = sum(kind == "password" for _, _, kind in selected)
+        password_note = (
+            f"\n\n{password_count} password column(s) will be set for every row to:\n"
+            f"{DEFAULT_PASSWORD_HASH}\nDefault login password: 1"
+            if password_count else ""
+        )
+        if not self._confirm(
+            "Confirm permanent replacement",
+            f"Permanently replace values in {len(selected)} column(s) in {database}?{password_note}",
+            True,
+        ):
             return
         self._sync_config()
         replacement_email = self.email_replacement.get()
         replacement_phone = self.phone_replacement.get()
+        replacement_password = DEFAULT_PASSWORD_HASH
         self.sanitize_button.configure(state="disabled")
         self.sanitize_status.set("Replacing values…")
-        def esc(value): return value.replace("\\", "\\\\").replace("'", "\\'")
         def worker():
             errors, completed = [], 0
             for index, (table, column, kind) in enumerate(selected, 1):
-                value = replacement_email if kind == "email" else replacement_phone
-                table_q, column_q = table.replace("`", "``"), column.replace("`", "``")
-                query = f"UPDATE `{table_q}` SET `{column_q}`='{esc(value)}' WHERE `{column_q}` IS NOT NULL AND `{column_q}`<>'';"
+                values = {"email": replacement_email, "phone": replacement_phone, "password": replacement_password}
+                query = build_sanitize_query(table, column, kind, values[kind])
                 try:
                     self.service.run(["-e", query], database=database, timeout=300)
                     completed += 1

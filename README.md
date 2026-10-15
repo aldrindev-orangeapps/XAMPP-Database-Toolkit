@@ -6,15 +6,17 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 
 - Checkpointed, bounded-memory import for 1 GB+ phpMyAdmin and mysqldump files
 - Confirmed-statement progress instead of optimistic pipe progress
+- Live transfer speed, elapsed time, and estimated remaining time during imports
 - Safe reconnect attempts after MySQL connection failures
 - Resume after reopening the app when the file and target connection have not changed
 - Database creation, search, selection, and protected deletion
 - SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
-- Email and phone column scanner/sanitizer
+- Email, phone, and password column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
 - Single-administrator login, logout, failed-attempt lockout, and idle auto-lock
 - Original database-import security icon for the window, taskbar, and EXE
 - Poppins Regular, Medium, and SemiBold bundled into the standalone EXE
+- Vertically scrollable main pages for smaller windows and longer content
 
 ## Requirements
 
@@ -53,7 +55,9 @@ python -m PyInstaller --onefile --windowed --name "XAMPP Database Toolkit" --ico
 4. Safe connection failures are retried five times with increasing delays.
 5. If a non-transactional statement may have committed during a disconnect, the app asks whether to retry, skip, or stop. It never silently risks duplicating data.
 
-Checkpoints are stored in `~/.xampp_sql_importer/checkpoints.json`. A checkpoint is accepted only when the file path, size, modification time, server, port, and database match. Successful imports remove their checkpoint.
+Checkpoints are stored under `~/.xampp_sql_importer`. Confirmed offsets use a lightweight append-only journal and are periodically compacted into `checkpoints.json`; this preserves statement-level recovery without rewriting the complete checkpoint file after every statement. A checkpoint is accepted only when the file path, size, modification time, server, port, and database match. Successful imports remove their checkpoint.
+
+Critical mysqldump session settings—including foreign-key checks, unique checks, SQL mode, and time zone—are pinned in the checkpoint and restored after reopening or reconnecting. Older checkpoints recover these settings from the dump preamble before resuming.
 
 The parser supports standard phpMyAdmin/mysqldump schema and data exports, including comments, quoted semicolons, multiline statements, and transactions. Scripts using custom `DELIMITER` blocks, stored procedures, functions, or triggers are rejected because arbitrary resume points are unsafe for them.
 
@@ -73,7 +77,8 @@ This local login protects against casual access to the application. The Windows 
 
 - **Delete selected** requires the exact database name. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
-- **Sanitizer** scans the selected database for common email and phone column names. Replacements are permanent, so retain the original dump.
+- **Sanitizer** provides editable email, phone, and password column-name fields. Only exact case-insensitive matches are listed and updated. Replacements are permanent, so retain the original dump.
+- Detected password columns can be reset across every row to `c4ca4238a0b923820dcc509a6f75849b`, whose default login value is `1`.
 
 ## Settings and security
 
