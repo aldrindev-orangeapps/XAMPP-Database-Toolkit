@@ -14,6 +14,7 @@ from tkinter import filedialog, simpledialog, ttk
 
 from checkpoints import CheckpointStore
 from importer import ResumableImporter
+from local_auth import AuthError, LocalAuth
 from mysql_service import MySQLConfig, MySQLService, SYSTEM_DATABASES
 from sql_parser import is_read_only_sql, split_sql_text
 
@@ -31,6 +32,7 @@ BG, SURFACE, SIDEBAR, SIDEBAR_HOVER = "#F5F7FB", "#FFFFFF", "#111827", "#1F2937"
 PRIMARY, PRIMARY_DARK = "#4F46E5", "#4338CA"
 TEXT, MUTED, BORDER = "#111827", "#6B7280", "#E5E7EB"
 SUCCESS, DANGER = "#059669", "#DC2626"
+IDLE_LOGOUT_SECONDS = 15 * 60
 
 
 def resource_path(relative: str) -> str:
@@ -76,6 +78,9 @@ class ModernApp:
         self.importer = None
         self.import_cancel = threading.Event()
         self.import_started = 0.0
+        self.auth = LocalAuth()
+        self.authenticated = False
+        self.last_activity = time.monotonic()
 
         self._load_config()
         if not self.mysql_path.get():
@@ -86,8 +91,11 @@ class ModernApp:
         self.checkpoints = CheckpointStore()
         self._configure_style()
         self._build_shell()
-        self.show_page("Import")
-        root.after(250, self.refresh_databases)
+        self.app_shell.grid_remove()
+        self._show_auth_screen()
+        root.bind_all("<KeyPress>", self._record_activity, add="+")
+        root.bind_all("<ButtonPress>", self._record_activity, add="+")
+        root.after(30_000, self._check_idle_logout)
 
     def _configure_style(self):
         named = ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont", "TkHeadingFont",
@@ -124,10 +132,129 @@ class ModernApp:
         style.map("Treeview", background=[("selected", "#E0E7FF")], foreground=[("selected", TEXT)])
         style.configure("Horizontal.TProgressbar", background=PRIMARY, troughcolor="#E5E7EB", borderwidth=0)
 
+    def _show_auth_screen(self, notice=""):
+        if hasattr(self, "auth_screen") and self.auth_screen.winfo_exists():
+            self.auth_screen.destroy()
+        self.auth_screen = tk.Frame(self.root, bg=BG)
+        self.auth_screen.grid(row=0, column=0, sticky="nsew")
+        self.auth_screen.grid_rowconfigure(0, weight=1)
+        self.auth_screen.grid_columnconfigure(0, weight=1)
+
+        card = tk.Frame(self.auth_screen, bg=SURFACE, highlightthickness=1, highlightbackground=BORDER,
+                        padx=38, pady=34)
+        card.grid(row=0, column=0)
+        auth_error = ""
+        try:
+            configured = self.auth.is_configured
+        except AuthError as exc:
+            configured = True
+            auth_error = str(exc)
+        tk.Label(card, text="SQL IMPORTER", bg=SURFACE, fg=PRIMARY,
+                 font=(self.font_family, 10, "bold")).pack(anchor="w")
+        tk.Label(card, text="Welcome back" if configured else "Secure this application",
+                 bg=SURFACE, fg=TEXT, font=(self.font_family, 20, "bold")).pack(anchor="w", pady=(8, 4))
+        description = ("Enter the local administrator password to continue."
+                       if configured else
+                       "Create one administrator password. Only its salted hash will be stored locally.")
+        tk.Label(card, text=description, bg=SURFACE, fg=MUTED, justify="left", wraplength=350,
+                 font=(self.font_family, 9)).pack(anchor="w", pady=(0, 22))
+
+        self.auth_password = tk.StringVar()
+        self.auth_confirm = tk.StringVar()
+        tk.Label(card, text="Administrator password", bg=SURFACE, fg=MUTED,
+                 font=(self.font_family, 9)).pack(anchor="w")
+        password_entry = ttk.Entry(card, textvariable=self.auth_password, show="•")
+        password_entry.pack(fill="x", pady=(6, 13))
+        if not configured:
+            tk.Label(card, text="Confirm password", bg=SURFACE, fg=MUTED,
+                     font=(self.font_family, 9)).pack(anchor="w")
+            confirm_entry = ttk.Entry(card, textvariable=self.auth_confirm, show="•")
+            confirm_entry.pack(fill="x", pady=(6, 13))
+            confirm_entry.bind("<Return>", lambda _event: self._submit_auth())
+        password_entry.bind("<Return>", lambda _event: self._submit_auth())
+        self.auth_message = tk.StringVar(value=auth_error or notice)
+        tk.Label(card, textvariable=self.auth_message, bg=SURFACE,
+                 fg=DANGER if notice else MUTED, justify="left", wraplength=350,
+                 font=(self.font_family, 8)).pack(anchor="w", pady=(0, 10))
+        self.auth_button = ttk.Button(card, text="Login" if configured else "Create password",
+                                      style="Primary.TButton", command=self._submit_auth)
+        self.auth_button.pack(fill="x")
+        if auth_error:
+            self.auth_button.configure(state="disabled")
+        if not configured:
+            tk.Label(card, text="Minimum 8 characters", bg=SURFACE, fg=MUTED,
+                     font=(self.font_family, 8)).pack(anchor="center", pady=(12, 0))
+        password_entry.focus_set()
+
+    def _submit_auth(self):
+        password = self.auth_password.get()
+        try:
+            if not self.auth.is_configured:
+                if password != self.auth_confirm.get():
+                    self.auth_message.set("The passwords do not match.")
+                    return
+                self.auth.setup(password)
+            else:
+                valid, wait = self.auth.verify(password)
+                if not valid:
+                    self.auth_password.set("")
+                    self.auth_message.set(
+                        f"Too many failed attempts. Try again in {wait} seconds."
+                        if wait else "Incorrect administrator password."
+                    )
+                    return
+        except AuthError as exc:
+            self.auth_message.set(str(exc))
+            return
+        self.auth_password.set("")
+        self.auth_confirm.set("")
+        self.authenticated = True
+        self.last_activity = time.monotonic()
+        self.auth_screen.grid_remove()
+        self.app_shell.grid()
+        self.show_page("Import")
+        self.root.after(150, self.refresh_databases)
+
+    def logout(self, automatic=False):
+        if not self.authenticated:
+            return
+        if self.importer:
+            if automatic:
+                self.last_activity = time.monotonic()
+                return
+            if not self._confirm(
+                "Import in progress",
+                "Logging out will stop the import at its last confirmed checkpoint. Continue?",
+                True,
+            ):
+                return
+            self.importer.cancel()
+        self.authenticated = False
+        self.password.set("")
+        self.selected_db.set("")
+        self._sync_config()
+        self.connection_text.set("Not connected")
+        self.connection_badge.configure(bg="#F3F4F6", fg=MUTED)
+        self.app_shell.grid_remove()
+        self._show_auth_screen("Session locked due to inactivity." if automatic else "You have logged out safely.")
+
+    def _record_activity(self, _event=None):
+        if self.authenticated:
+            self.last_activity = time.monotonic()
+
+    def _check_idle_logout(self):
+        if self.authenticated and time.monotonic() - self.last_activity >= IDLE_LOGOUT_SECONDS:
+            self.logout(automatic=True)
+        self.root.after(30_000, self._check_idle_logout)
+
     def _build_shell(self):
         self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-        sidebar = tk.Frame(self.root, bg=SIDEBAR, width=210)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.app_shell = tk.Frame(self.root, bg=BG)
+        self.app_shell.grid(row=0, column=0, sticky="nsew")
+        self.app_shell.grid_rowconfigure(0, weight=1)
+        self.app_shell.grid_columnconfigure(1, weight=1)
+        sidebar = tk.Frame(self.app_shell, bg=SIDEBAR, width=210)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         tk.Label(sidebar, text="SQL IMPORTER", bg=SIDEBAR, fg="white", font=(self.font_family, 14, "bold"), anchor="w").pack(fill="x", padx=24, pady=(28, 4))
@@ -142,7 +269,7 @@ class ModernApp:
         tk.Label(sidebar, text="Settings are saved without\nyour password.", bg=SIDEBAR, fg="#6B7280",
                  justify="left", font=(self.font_family, 8)).pack(side="bottom", anchor="w", padx=24, pady=22)
 
-        main = tk.Frame(self.root, bg=BG)
+        main = tk.Frame(self.app_shell, bg=BG)
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_rowconfigure(1, weight=1)
         main.grid_columnconfigure(0, weight=1)
@@ -151,9 +278,10 @@ class ModernApp:
         header.grid_propagate(False)
         self.page_title = tk.Label(header, text="Import", bg=SURFACE, fg=TEXT, font=(self.font_family, 14, "bold"))
         self.page_title.pack(side="left", padx=28)
+        ttk.Button(header, text="Logout", command=self.logout).pack(side="right", padx=(8, 28), pady=17)
         self.connection_badge = tk.Label(header, textvariable=self.connection_text, bg="#F3F4F6", fg=MUTED,
                                          font=(self.font_family, 9, "bold"), padx=12, pady=6)
-        self.connection_badge.pack(side="right", padx=(8, 28))
+        self.connection_badge.pack(side="right", padx=(8, 0))
         self.database_badge = tk.Label(header, text="No database selected", bg="#EEF2FF", fg=PRIMARY,
                                        font=(self.font_family, 9, "bold"), padx=12, pady=6)
         self.database_badge.pack(side="right")
@@ -250,6 +378,7 @@ class ModernApp:
         ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=0, column=4, padx=(0, 8))
         actions = ttk.Frame(conn, style="Card.TFrame")
         actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="Change app password", command=self.change_app_password).pack(side="left")
         ttk.Button(actions, text="Save settings", command=self.save_config).pack(side="right")
         ttk.Button(actions, text="Test connection", style="Primary.TButton", command=self.test_connection).pack(side="right", padx=8)
         dbcard = self._card(body, "Available databases")
@@ -411,6 +540,45 @@ class ModernApp:
             ("Cancel", False, "TButton"),
             ("Continue", True, "Danger.TButton" if danger else "Primary.TButton"),
         ], danger))
+
+    def change_app_password(self):
+        window = tk.Toplevel(self.root)
+        window.title("Change app password")
+        window.configure(bg=SURFACE)
+        window.resizable(False, False)
+        window.transient(self.root)
+        tk.Frame(window, bg=PRIMARY, height=5).pack(fill="x")
+        content = tk.Frame(window, bg=SURFACE, padx=28, pady=24)
+        content.pack(fill="both", expand=True)
+        tk.Label(content, text="Change administrator password", bg=SURFACE, fg=TEXT,
+                 font=(self.font_family, 13, "bold")).pack(anchor="w", pady=(0, 14))
+        current, new, confirm = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        for label, variable in (("Current password", current), ("New password", new), ("Confirm new password", confirm)):
+            tk.Label(content, text=label, bg=SURFACE, fg=MUTED,
+                     font=(self.font_family, 9)).pack(anchor="w")
+            ttk.Entry(content, textvariable=variable, show="•", width=42).pack(fill="x", pady=(5, 11))
+        message = tk.StringVar()
+        tk.Label(content, textvariable=message, bg=SURFACE, fg=DANGER,
+                 font=(self.font_family, 8)).pack(anchor="w")
+        actions = tk.Frame(content, bg=SURFACE)
+        actions.pack(fill="x", pady=(12, 0))
+
+        def save():
+            if new.get() != confirm.get():
+                message.set("The new passwords do not match.")
+                return
+            try:
+                self.auth.change_password(current.get(), new.get())
+            except AuthError as exc:
+                message.set(str(exc))
+                return
+            window.destroy()
+            self._alert("Password changed", "The administrator password was updated successfully.")
+
+        ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right")
+        ttk.Button(actions, text="Update password", style="Primary.TButton", command=save).pack(side="right", padx=8)
+        window.grab_set()
+        window.focus_force()
 
     def log(self, message):
         def append():

@@ -12,6 +12,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email and phone column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
+- Single-administrator login, logout, failed-attempt lockout, and idle auto-lock
 - Poppins Regular, Medium, and SemiBold bundled into the standalone EXE
 
 ## Requirements
@@ -54,6 +55,18 @@ python -m PyInstaller --onefile --windowed --name "XAMPP SQL Importer" --add-dat
 Checkpoints are stored in `~/.xampp_sql_importer/checkpoints.json`. A checkpoint is accepted only when the file path, size, modification time, server, port, and database match. Successful imports remove their checkpoint.
 
 The parser supports standard phpMyAdmin/mysqldump schema and data exports, including comments, quoted semicolons, multiline statements, and transactions. Scripts using custom `DELIMITER` blocks, stored procedures, functions, or triggers are rejected because arbitrary resume points are unsafe for them.
+
+## Local administrator login
+
+The first launch asks you to create one administrator password with at least eight characters. The app stores only a randomly salted PBKDF2-SHA256 hash in `~/.xampp_sql_importer/auth.json`; it never stores the original password.
+
+- Five failed attempts trigger a persistent timed lockout.
+- **Logout** is always available in the header.
+- An inactive session automatically locks after 15 minutes. An active import is allowed to reach a safe state before auto-locking.
+- Logging out clears the in-memory MySQL password and selected database.
+- The administrator password can be changed from **Databases → Change app password**.
+
+This local login protects against casual access to the application. The Windows account and its filesystem permissions remain the security boundary: anyone who controls that Windows account can modify the application or its local authentication file.
 
 ## Database tools
 
