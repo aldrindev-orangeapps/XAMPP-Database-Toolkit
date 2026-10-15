@@ -311,7 +311,7 @@ class ModernApp:
                                relief="flat", anchor="w", padx=24, pady=11, font=(self.font_family, 10), cursor="hand2")
             button.pack(fill="x", padx=10, pady=2)
             self.nav_buttons[page] = button
-        tk.Label(sidebar, text="Settings are saved without\nyour password.", bg=SIDEBAR, fg="#6B7280",
+        tk.Label(sidebar, text="NOT FOR SALE", bg=SIDEBAR, fg="#6B7280",
                  justify="left", font=(self.font_family, 8)).pack(side="bottom", anchor="w", padx=24, pady=22)
 
         main = tk.Frame(self.app_shell, bg=BG)
