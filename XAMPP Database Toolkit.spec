@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['xampp_sql_importer.py'],
+    ['xampp_database_toolkit.py'],
     pathex=[],
     binaries=[],
     datas=[('assets/fonts', 'assets/fonts'), ('assets/icons', 'assets/icons')],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='XAMPP SQL Importer',
+    name='XAMPP Database Toolkit',
     icon='assets/icons/app-icon.ico',
     debug=False,
     bootloader_ignore_signals=False,

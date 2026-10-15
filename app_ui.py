@@ -1,4 +1,4 @@
-"""Modern Tkinter user interface for XAMPP SQL Importer."""
+"""Modern Tkinter user interface for XAMPP Database Toolkit."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class ModernApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.font_family = register_poppins()
-        root.title("XAMPP SQL Importer")
+        root.title("XAMPP Database Toolkit")
         root.geometry("1120x740")
         root.minsize(960, 640)
         root.configure(bg=BG)
@@ -165,7 +165,7 @@ class ModernApp:
         except AuthError as exc:
             configured = True
             auth_error = str(exc)
-        tk.Label(card, text="SQL IMPORTER", bg=SURFACE, fg=PRIMARY,
+        tk.Label(card, text="XAMPP DATABASE TOOLKIT", bg=SURFACE, fg=PRIMARY,
                  font=(self.font_family, 10, "bold")).pack(anchor="w")
         tk.Label(card, text="Welcome back" if configured else "Secure this application",
                  bg=SURFACE, fg=TEXT, font=(self.font_family, 20, "bold")).pack(anchor="w", pady=(8, 4))
@@ -302,8 +302,8 @@ class ModernApp:
         sidebar = tk.Frame(self.app_shell, bg=SIDEBAR, width=210)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
-        tk.Label(sidebar, text="SQL IMPORTER", bg=SIDEBAR, fg="white", font=(self.font_family, 14, "bold"), anchor="w").pack(fill="x", padx=24, pady=(28, 4))
-        tk.Label(sidebar, text="XAMPP database tools", bg=SIDEBAR, fg="#9CA3AF", font=(self.font_family, 9), anchor="w").pack(fill="x", padx=24, pady=(0, 28))
+        tk.Label(sidebar, text="DB TOOLKIT", bg=SIDEBAR, fg="white", font=(self.font_family, 14, "bold"), anchor="w").pack(fill="x", padx=24, pady=(28, 4))
+        tk.Label(sidebar, text="Import • Query • Sanitize", bg=SIDEBAR, fg="#9CA3AF", font=(self.font_family, 9), anchor="w").pack(fill="x", padx=24, pady=(0, 28))
         self.nav_buttons = {}
         for page in ("Import", "Databases", "SQL Console", "Sanitizer", "Logs"):
             button = tk.Button(sidebar, text=page, command=lambda value=page: self.show_page(value), bg=SIDEBAR,
@@ -987,7 +987,7 @@ def run_app():
     if os.name == "nt":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "AldrinCaballero.XAMMPSQLImporter"
+                "AldrinCaballero.XAMPPDatabaseToolkit"
             )
         except (AttributeError, OSError):
             pass

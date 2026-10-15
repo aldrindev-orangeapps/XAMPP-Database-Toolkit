@@ -1,4 +1,4 @@
-# XAMPP SQL Importer & Data Sanitizer
+# XAMPP Database Toolkit
 
 A modern Windows desktop tool for importing large SQL dumps, managing local XAMPP databases, running SQL, and sanitizing development data. The interface uses the bundled **Poppins** font and only requires `mysql.exe` at runtime.
 
@@ -25,7 +25,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 ## Run from source
 
 ```powershell
-python .\xampp_sql_importer.py
+python .\xampp_database_toolkit.py
 ```
 
 ## Build the standalone EXE
@@ -34,15 +34,15 @@ Install PyInstaller, then build with the checked-in spec file:
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --noconfirm ".\XAMPP SQL Importer.spec"
+python -m PyInstaller --noconfirm ".\XAMPP Database Toolkit.spec"
 ```
 
-The result is written to `dist\XAMPP SQL Importer.exe`.
+The result is written to `dist\XAMPP Database Toolkit.exe`.
 
 The spec includes the Poppins files from `assets\fonts`. To build without it:
 
 ```powershell
-python -m PyInstaller --onefile --windowed --name "XAMPP SQL Importer" --add-data "assets\fonts;assets\fonts" .\xampp_sql_importer.py
+python -m PyInstaller --onefile --windowed --name "XAMPP Database Toolkit" --icon "assets\icons\app-icon.ico" --add-data "assets\fonts;assets\fonts" --add-data "assets\icons;assets\icons" .\xampp_database_toolkit.py
 ```
 
 ## Import and recovery

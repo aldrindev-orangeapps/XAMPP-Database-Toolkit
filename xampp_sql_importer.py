@@ -1,4 +1,4 @@
-"""Windows entry point for XAMPP SQL Importer."""
+"""Compatibility entry point for XAMPP Database Toolkit."""
 
 from app_ui import run_app
 
