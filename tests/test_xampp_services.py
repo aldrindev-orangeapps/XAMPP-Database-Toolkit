@@ -3,7 +3,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app_ui import launch_xampp_service_script, xampp_root_from_mysql, xampp_service_running, xampp_web_urls
+from app_ui import (
+    launch_xampp_service_script,
+    stop_xampp_mysql,
+    xampp_root_from_mysql,
+    xampp_service_running,
+    xampp_web_urls,
+)
+from mysql_service import MySQLConfig
 
 
 class XamppServiceTests(unittest.TestCase):
@@ -76,6 +83,27 @@ class XamppServiceTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual("call", command[-2])
         self.assertTrue(command[-1].endswith("apache_start.bat"))
+
+    @patch("app_ui.subprocess.run")
+    def test_mysql_stop_targets_selected_version_and_connection(self, run):
+        run.return_value.returncode = 0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = os.path.join(temp_dir, "mysql", "bin")
+            os.makedirs(bin_dir)
+            mysqladmin = os.path.join(bin_dir, "mysqladmin.exe")
+            with open(mysqladmin, "wb"):
+                pass
+            config = MySQLConfig(
+                os.path.join(bin_dir, "mysql.exe"), "127.0.0.1", "3310", "admin", "secret"
+            )
+            stop_xampp_mysql(temp_dir, config)
+
+        command = run.call_args.args[0]
+        self.assertEqual(mysqladmin, command[0])
+        self.assertIn("3310", command)
+        self.assertIn("admin", command)
+        self.assertNotIn("secret", command)
+        self.assertEqual("secret", run.call_args.kwargs["env"]["MYSQL_PWD"])
 
 
 if __name__ == "__main__":

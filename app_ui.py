@@ -130,6 +130,37 @@ def launch_xampp_service_script(root: str, service: str, action: str) -> None:
     )
 
 
+def stop_xampp_mysql(root: str, config: MySQLConfig) -> subprocess.CompletedProcess[str]:
+    """Gracefully stop the selected XAMPP MySQL/MariaDB instance.
+
+    XAMPP's stock mysql_stop.bat assumes the default root account and port.  That
+    is ambiguous when several XAMPP versions are installed, so invoke the
+    mysqladmin belonging to the selected installation with the connection
+    settings currently shown in the UI.
+    """
+    executable = os.path.join(root, "mysql", "bin", "mysqladmin.exe")
+    if not os.path.isfile(executable):
+        raise FileNotFoundError(f"XAMPP mysqladmin was not found: {executable}")
+    command = [
+        executable,
+        "--protocol=tcp",
+        "--host", config.host or "127.0.0.1",
+        "--port", config.port or "3306",
+        "--user", config.user or "root",
+        "--connect-timeout=10",
+        "shutdown",
+    ]
+    environment = os.environ.copy()
+    if config.password:
+        environment["MYSQL_PWD"] = config.password
+    else:
+        environment.pop("MYSQL_PWD", None)
+    return subprocess.run(
+        command, cwd=root, capture_output=True, text=True, timeout=15,
+        env=environment, creationflags=CREATE_NO_WINDOW,
+    )
+
+
 def xampp_web_urls(root: str) -> tuple[str, str]:
     """Build local-site URLs from Apache's first active Listen directive."""
     port = "80"
@@ -1203,6 +1234,8 @@ class ModernApp:
         except Exception as exc:
             self._alert("XAMPP not found", str(exc), True)
             return
+        self._sync_config()
+        mysql_config = self._config_value
 
         status_var = self.apache_service_status if service == "apache" else self.mysql_service_status
         status_var.set("Starting..." if action == "start" else "Stopping...")
@@ -1214,15 +1247,25 @@ class ModernApp:
             desired_running = action == "start"
             try:
                 if xampp_service_running(service, root) != desired_running:
-                    launch_xampp_service_script(root, service, action)
+                    stop_result = None
+                    if service == "mysql" and action == "stop":
+                        stop_result = stop_xampp_mysql(root, mysql_config)
+                    else:
+                        launch_xampp_service_script(root, service, action)
                     for _ in range(15):
                         time.sleep(1)
                         if xampp_service_running(service, root) == desired_running:
                             break
                     else:
                         verb = "start" if desired_running else "stop"
+                        detail = ""
+                        if stop_result is not None and stop_result.returncode:
+                            output = (stop_result.stderr or stop_result.stdout).strip()
+                            if output:
+                                detail = f"\n\nmysqladmin: {output}"
                         raise RuntimeError(
                             f"{label} did not {verb} within 15 seconds. Check the XAMPP logs for details."
+                            f"{detail}"
                         )
             except Exception as exc:
                 error = str(exc)
