@@ -6,11 +6,13 @@ import configparser
 import ctypes
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from tkinter import filedialog, simpledialog, ttk
 
 from checkpoints import CheckpointStore, checkpoint_key
@@ -32,6 +34,13 @@ PRIMARY, PRIMARY_DARK = "#4F46E5", "#4338CA"
 TEXT, MUTED, BORDER = "#111827", "#6B7280", "#E5E7EB"
 SUCCESS, DANGER = "#059669", "#DC2626"
 IDLE_LOGOUT_SECONDS = 15 * 60
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+XAMPP_SERVICES = {
+    "apache": {"process": "httpd.exe", "label": "Apache"},
+    "mysql": {"process": "mysqld.exe", "label": "MySQL"},
+}
+NAVIGATION_PAGES = ("Databases", "Import", "Sanitizer", "SQL Console", "Logs", "User Manual")
 
 SQL_KEYWORDS = (
     "ADD|ALL|ALTER|AND|AS|ASC|BETWEEN|BY|CASE|COLUMN|CONSTRAINT|CREATE|CROSS|"
@@ -49,6 +58,64 @@ SQL_TOKEN_PATTERN = re.compile(
     rf"|(?P<keyword>\b(?:{SQL_KEYWORDS})\b)",
     re.IGNORECASE,
 )
+
+
+def xampp_root_from_mysql(mysql_executable: str) -> str:
+    """Return the XAMPP root for .../mysql/bin/mysql.exe or raise a clear error."""
+    path = os.path.abspath(os.path.expanduser(mysql_executable.strip()))
+    bin_dir = os.path.dirname(path)
+    mysql_dir = os.path.dirname(bin_dir)
+    root = os.path.dirname(mysql_dir)
+    if (
+        os.path.basename(path).casefold() != "mysql.exe"
+        or os.path.basename(bin_dir).casefold() != "bin"
+        or os.path.basename(mysql_dir).casefold() != "mysql"
+        or not os.path.isfile(path)
+    ):
+        raise FileNotFoundError("Select XAMPP's mysql\\bin\\mysql.exe in Connection settings.")
+    return root
+
+
+def xampp_service_running(service: str) -> bool:
+    details = XAMPP_SERVICES[service]
+    result = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {details['process']}", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, timeout=8, creationflags=CREATE_NO_WINDOW,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "Could not check Windows process status.").strip())
+    return f'"{details["process"]}"'.casefold() in result.stdout.casefold()
+
+
+def launch_xampp_service_script(root: str, service: str, action: str) -> None:
+    if service not in XAMPP_SERVICES or action not in {"start", "stop"}:
+        raise ValueError("Unsupported XAMPP service action.")
+    script = os.path.join(root, f"{service}_{action}.bat")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"XAMPP script was not found: {script}")
+    command_shell = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    subprocess.Popen(
+        [command_shell, "/D", "/C", "call", script], cwd=root,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+    )
+
+
+def xampp_web_urls(root: str) -> tuple[str, str]:
+    """Build local-site URLs from Apache's first active Listen directive."""
+    port = "80"
+    config_path = os.path.join(root, "apache", "conf", "httpd.conf")
+    try:
+        with open(config_path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = re.match(r"^\s*Listen\s+(?:\[[^]]+\]|[^\s:]+:)?(\d+)\s*(?:#.*)?$", line)
+                if match:
+                    port = match.group(1)
+                    break
+    except OSError:
+        pass
+    base = "http://localhost" + ("" if port == "80" else f":{port}") + "/"
+    return base, base + "phpmyadmin/"
 
 
 def parse_column_names(value: str) -> list[str]:
@@ -125,6 +192,11 @@ class ModernApp:
         self.continue_on_error = tk.BooleanVar(value=True)
         self.connection_text, self.search_db = tk.StringVar(value="Not connected"), tk.StringVar()
         self.database_status = tk.StringVar(value="Ready")
+        self.apache_service_status = tk.StringVar(value="Not checked")
+        self.mysql_service_status = tk.StringVar(value="Not checked")
+        self.local_site_url = tk.StringVar(value="http://localhost/")
+        self.phpmyadmin_url = tk.StringVar(value="http://localhost/phpmyadmin/")
+        self.xampp_service_states = {"apache": False, "mysql": False}
         self.import_status, self.import_detail = tk.StringVar(value="Ready to import"), tk.StringVar(value="Select a SQL dump to begin.")
         self.email_replacement, self.phone_replacement = tk.StringVar(value="test@example.com"), tk.StringVar(value="09170000000")
         self.password_replacement = tk.StringVar(value=DEFAULT_PASSWORD_HASH)
@@ -138,7 +210,7 @@ class ModernApp:
         self.import_cancel = threading.Event()
         self.import_started = 0.0
         self.after_import_action = None
-        self.active_page = "Import"
+        self.active_page = "Databases"
         self.page_canvases = {}
         self.auth = LocalAuth()
         self.authenticated = False
@@ -274,7 +346,7 @@ class ModernApp:
         if auth_error:
             self.auth_button.configure(state="disabled")
         if not configured:
-            tk.Label(card, text="Minimum 8 characters", bg=SURFACE, fg=MUTED,
+            tk.Label(card, text="Minimum 4 characters", bg=SURFACE, fg=MUTED,
                      font=(self.font_family, 8)).pack(anchor="center", pady=(12, 0))
         password_entry.focus_set()
 
@@ -320,8 +392,9 @@ class ModernApp:
         self.last_activity = time.monotonic()
         self.auth_screen.grid_remove()
         self.app_shell.grid()
-        self.show_page("Import")
+        self.show_page("Databases")
         self.root.after(150, self.refresh_databases)
+        self.root.after(200, self.refresh_xampp_services)
 
     def logout(self, automatic=False):
         if not self.authenticated:
@@ -373,9 +446,9 @@ class ModernApp:
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         tk.Label(sidebar, text="DB TOOLKIT", bg=SIDEBAR, fg="white", font=(self.font_family, 14, "bold"), anchor="w").pack(fill="x", padx=24, pady=(28, 4))
-        tk.Label(sidebar, text="Import • Query • Sanitize", bg=SIDEBAR, fg="#9CA3AF", font=(self.font_family, 9), anchor="w").pack(fill="x", padx=24, pady=(0, 28))
+        tk.Label(sidebar, text="Database | Import | Sanitize", bg=SIDEBAR, fg="#9CA3AF", font=(self.font_family, 9), anchor="w").pack(fill="x", padx=24, pady=(0, 28))
         self.nav_buttons = {}
-        for page in ("Import", "Databases", "SQL Console", "Sanitizer", "Logs"):
+        for page in NAVIGATION_PAGES:
             button = tk.Button(sidebar, text=page, command=lambda value=page: self.show_page(value), bg=SIDEBAR,
                                fg="#D1D5DB", activebackground=SIDEBAR_HOVER, activeforeground="white", bd=0,
                                relief="flat", anchor="w", padx=24, pady=11, font=(self.font_family, 10), cursor="hand2")
@@ -391,7 +464,7 @@ class ModernApp:
         header = tk.Frame(main, bg=SURFACE, height=72, highlightthickness=1, highlightbackground=BORDER)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_propagate(False)
-        self.page_title = tk.Label(header, text="Import", bg=SURFACE, fg=TEXT, font=(self.font_family, 14, "bold"))
+        self.page_title = tk.Label(header, text="Databases", bg=SURFACE, fg=TEXT, font=(self.font_family, 14, "bold"))
         self.page_title.pack(side="left", padx=28)
         ttk.Button(header, text="Logout", command=self.logout).pack(side="right", padx=(8, 28), pady=17)
         self.connection_badge = tk.Label(header, textvariable=self.connection_text, bg="#F3F4F6", fg=MUTED,
@@ -420,6 +493,7 @@ class ModernApp:
         self._build_query_page()
         self._build_sanitize_page()
         self._build_logs_page()
+        self._build_manual_page()
         self.selected_db.trace_add("write", lambda *_: self.database_badge.configure(text=self.selected_db.get() or "No database selected"))
 
     def _new_page(self, name):
@@ -544,8 +618,61 @@ class ModernApp:
         ttk.Button(actions, text="Change app password", command=self.change_app_password).pack(side="left")
         ttk.Button(actions, text="Save settings", command=self.save_config).pack(side="right")
         ttk.Button(actions, text="Test connection", style="Primary.TButton", command=self.test_connection).pack(side="right", padx=8)
+        services = self._card(
+            body, "XAMPP services",
+            "Start or stop the local services using the official scripts in the selected XAMPP folder.",
+            padding=16, subtitle_gap=8,
+        )
+        services.pack(fill="x", pady=(14, 0))
+        service_grid = tk.Frame(services, bg=SURFACE)
+        service_grid.pack(fill="x")
+        service_grid.columnconfigure(0, weight=1)
+        service_grid.columnconfigure(1, weight=1)
+        self.xampp_service_buttons = {}
+        for column, (service, label, status_var) in enumerate((
+            ("apache", "Apache web server", self.apache_service_status),
+            ("mysql", "MySQL database", self.mysql_service_status),
+        )):
+            panel = tk.Frame(
+                service_grid, bg="#F9FAFB", padx=14, pady=10,
+                highlightthickness=1, highlightbackground=BORDER,
+            )
+            panel.grid(row=0, column=column, sticky="ew", padx=(0, 6) if column == 0 else (6, 0))
+            heading = tk.Frame(panel, bg="#F9FAFB")
+            heading.pack(fill="x")
+            tk.Label(heading, text=label, bg="#F9FAFB", fg=TEXT,
+                     font=(self.font_family, 10, "bold")).pack(side="left")
+            tk.Label(heading, textvariable=status_var, bg="#F9FAFB", fg=MUTED,
+                     font=(self.font_family, 9)).pack(side="right")
+            controls = tk.Frame(panel, bg="#F9FAFB")
+            controls.pack(fill="x", pady=(8, 0))
+            start_button = ttk.Button(
+                controls, text="Start", style="Primary.TButton",
+                command=lambda name=service: self.control_xampp_service(name, "start"),
+            )
+            stop_button = ttk.Button(
+                controls, text="Stop",
+                command=lambda name=service: self.control_xampp_service(name, "stop"),
+            )
+            start_button.pack(side="left")
+            stop_button.pack(side="left", padx=(8, 0))
+            self.xampp_service_buttons[service] = {"start": start_button, "stop": stop_button}
+        service_footer = tk.Frame(services, bg=SURFACE)
+        service_footer.pack(fill="x", pady=(10, 0))
+        tk.Label(service_footer, text="Quick links:", bg=SURFACE, fg=MUTED,
+                 font=(self.font_family, 9, "bold")).pack(side="left")
+        self.xampp_link_labels = {}
+        for kind, variable in (("site", self.local_site_url), ("phpmyadmin", self.phpmyadmin_url)):
+            link = tk.Label(
+                service_footer, textvariable=variable, bg=SURFACE, fg=MUTED,
+                font=(self.font_family, 9, "underline"), cursor="arrow",
+            )
+            link.pack(side="left", padx=(10, 0))
+            link.bind("<Button-1>", lambda _event, name=kind: self._open_xampp_url(name))
+            self.xampp_link_labels[kind] = link
+        ttk.Button(service_footer, text="Refresh status", command=self.refresh_xampp_services).pack(side="right")
         dbcard = ttk.Frame(body, style="Card.TFrame", padding=16)
-        dbcard.pack(fill="both", expand=True, pady=(18, 0))
+        dbcard.pack(fill="both", expand=True, pady=(14, 0))
         db_heading = ttk.Frame(dbcard, style="Card.TFrame")
         db_heading.pack(fill="x", pady=(0, 10))
         ttk.Label(db_heading, text="Available databases", style="Heading.TLabel").pack(side="left")
@@ -733,6 +860,83 @@ class ModernApp:
                                 insertbackground="white", bd=0, padx=14, pady=14, font=(self.font_family, 9))
         self.log_text.pack(fill="both", expand=True)
 
+    def _build_manual_page(self):
+        page = self._new_page("User Manual")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True, padx=28, pady=24)
+        ttk.Label(body, text="User manual", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text="A practical guide to setting up and safely using every feature in the toolkit.",
+            foreground=MUTED,
+        ).pack(anchor="w", pady=(2, 18))
+
+        sections = (
+            (
+                "Quick start",
+                "1. Open Databases and select C:\\xampp\\mysql\\bin\\mysql.exe.\n"
+                "2. Start MySQL if its status is Stopped. Start Apache if your local website needs it.\n"
+                "3. Enter the host, port, MySQL user, and password, then click Test connection.\n"
+                "4. Select an existing database or create a new one.\n"
+                "5. Continue to Import, Sanitizer, or SQL Console.",
+            ),
+            (
+                "Databases and XAMPP services",
+                "Use Start and Stop to control Apache and MySQL. Refresh status checks whether httpd.exe and "
+                "mysqld.exe are running. Save settings stores the MySQL path, host, port, and user, but never "
+                "the MySQL password. Quick links open the local index when Apache is running and phpMyAdmin when "
+                "both Apache and MySQL are running.\n\n"
+                "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
+                "Delete selected permanently removes the selected database after exact-name confirmation. "
+                "MySQL cannot be stopped while an import is active.",
+            ),
+            (
+                "Import SQL dumps",
+                "Select the target database first, open Import, choose a .sql file, and click Start import. "
+                "The progress bar advances only after MySQL confirms complete statements.\n\n"
+                "If an import is cancelled or interrupted, its confirmed checkpoint is preserved. When the same "
+                "file and database are used again, choose Resume to continue, Start fresh to restart, or Cancel. "
+                "Keep the app open while a large current statement finishes during a safe cancellation.",
+            ),
+            (
+                "Sanitize development data",
+                "Configure the exact email, phone, and password column names, separated by commas when needed. "
+                "Select a database, click Scan database, review the detected columns, then click Replace selected.\n\n"
+                "Email and phone values are replaced only when non-empty. Password matches are reset on every row "
+                "to the displayed hash whose login value is 1. Sanitizer changes are permanent, so retain the "
+                "original SQL dump as your backup.",
+            ),
+            (
+                "SQL Console",
+                "Enter SQL in the syntax-highlighted editor. Select part of the SQL to run only that selection, "
+                "or leave nothing selected to run the complete editor. Click Execute SQL or press Ctrl+Enter.\n\n"
+                "Read-only queries run immediately. Statements that may change data or schema require confirmation. "
+                "Results show up to 1,000 rows. Clear editor removes the query text and can be reversed with Ctrl+Z.",
+            ),
+            (
+                "Logs, login, and safety",
+                "Logs records connection, import, SQL, sanitizer, and service activity for the current session. "
+                "Use Change app password under Databases to update the administrator password; the minimum is four "
+                "characters. Five failed attempts trigger a timed lockout, and an inactive session locks after 15 minutes.\n\n"
+                "Always keep a backup before deleting databases or sanitizing data. Do not close XAMPP or stop MySQL "
+                "during an active import.",
+            ),
+            (
+                "Common problems",
+                "MySQL not found: Browse to C:\\xampp\\mysql\\bin\\mysql.exe.\n"
+                "Connection failed: Start MySQL and verify the host, port, user, and password.\n"
+                "Apache will not start: Another application may already be using port 80 or 443; check Apache logs.\n"
+                "Import cannot use DELIMITER: Export ordinary schema/data SQL without stored routines or triggers.\n"
+                "More details: Review the Logs page for the exact error message.",
+            ),
+        )
+        for index, (title, content) in enumerate(sections):
+            card = self._card(body, title, padding=18, spacer_height=4)
+            card.pack(fill="x", pady=(0 if index == 0 else 10, 0))
+            ttk.Label(
+                card, text=content, style="Card.TLabel", justify="left", wraplength=840,
+            ).pack(anchor="w", fill="x")
+
     def show_page(self, name):
         self.pages[name].tkraise()
         self.active_page = name
@@ -868,6 +1072,145 @@ class ModernApp:
         path = filedialog.askopenfilename(title="Select mysql.exe", filetypes=[("MySQL client", "mysql.exe"), ("All files", "*.*")])
         if path:
             self.mysql_path.set(path)
+            self.refresh_xampp_services()
+
+    def refresh_xampp_services(self, notify=False):
+        try:
+            root = xampp_root_from_mysql(self.mysql_path.get())
+        except Exception as exc:
+            self.xampp_service_states = {"apache": False, "mysql": False}
+            self._update_xampp_quick_links()
+            for service, status_var in (("apache", self.apache_service_status), ("mysql", self.mysql_service_status)):
+                status_var.set("Setup required")
+                for button in self.xampp_service_buttons[service].values():
+                    button.configure(state="disabled")
+            if notify:
+                self._alert("XAMPP not found", str(exc), True)
+            return
+
+        for service, status_var in (("apache", self.apache_service_status), ("mysql", self.mysql_service_status)):
+            status_var.set("Checking...")
+            for button in self.xampp_service_buttons[service].values():
+                button.configure(state="disabled")
+
+        def worker():
+            try:
+                statuses = {service: xampp_service_running(service) for service in XAMPP_SERVICES}
+                self._ui(self._apply_xampp_service_statuses, statuses)
+            except Exception as exc:
+                self._ui(self._xampp_status_failed, str(exc), notify)
+        self._thread(worker)
+
+    def _apply_xampp_service_statuses(self, statuses):
+        self.xampp_service_states = dict(statuses)
+        for service, running in statuses.items():
+            status_var = self.apache_service_status if service == "apache" else self.mysql_service_status
+            status_var.set("Running" if running else "Stopped")
+            self.xampp_service_buttons[service]["start"].configure(state="disabled" if running else "normal")
+            self.xampp_service_buttons[service]["stop"].configure(state="normal" if running else "disabled")
+        self._update_xampp_quick_links()
+
+    def _xampp_status_failed(self, error, notify=False):
+        self.xampp_service_states = {"apache": False, "mysql": False}
+        self._update_xampp_quick_links()
+        self.apache_service_status.set("Status unavailable")
+        self.mysql_service_status.set("Status unavailable")
+        for buttons in self.xampp_service_buttons.values():
+            for button in buttons.values():
+                button.configure(state="disabled")
+        self.log(f"XAMPP status check failed: {error}")
+        if notify:
+            self._alert("Status check failed", error, True)
+
+    def _update_xampp_quick_links(self):
+        try:
+            root = xampp_root_from_mysql(self.mysql_path.get())
+            site_url, phpmyadmin_url = xampp_web_urls(root)
+        except Exception:
+            site_url, phpmyadmin_url = "http://localhost/", "http://localhost/phpmyadmin/"
+        self.local_site_url.set(site_url)
+        self.phpmyadmin_url.set(phpmyadmin_url)
+        availability = {
+            "site": self.xampp_service_states.get("apache", False),
+            "phpmyadmin": (
+                self.xampp_service_states.get("apache", False)
+                and self.xampp_service_states.get("mysql", False)
+            ),
+        }
+        for kind, available in availability.items():
+            self.xampp_link_labels[kind].configure(
+                fg=PRIMARY if available else MUTED,
+                cursor="hand2" if available else "arrow",
+            )
+
+    def _open_xampp_url(self, kind):
+        apache_running = self.xampp_service_states.get("apache", False)
+        mysql_running = self.xampp_service_states.get("mysql", False)
+        if not apache_running:
+            self._alert("Apache is stopped", "Start Apache before opening this local URL.")
+            return
+        if kind == "phpmyadmin" and not mysql_running:
+            self._alert("MySQL is stopped", "Start MySQL before opening phpMyAdmin.")
+            return
+        url = self.phpmyadmin_url.get() if kind == "phpmyadmin" else self.local_site_url.get()
+        if not webbrowser.open_new_tab(url):
+            self._alert("Could not open browser", f"Open this URL manually:\n\n{url}", True)
+
+    def control_xampp_service(self, service, action):
+        label = XAMPP_SERVICES[service]["label"]
+        if action == "stop" and service == "mysql" and self.importer:
+            self._alert("Import in progress", "Stop the active import before stopping MySQL.", True)
+            return
+        if action == "stop" and not self._confirm(
+            f"Stop {label}",
+            f"Stop the local {label} service? Applications currently using it may be interrupted.",
+            True,
+        ):
+            return
+        try:
+            root = xampp_root_from_mysql(self.mysql_path.get())
+        except Exception as exc:
+            self._alert("XAMPP not found", str(exc), True)
+            return
+
+        status_var = self.apache_service_status if service == "apache" else self.mysql_service_status
+        status_var.set("Starting..." if action == "start" else "Stopping...")
+        for button in self.xampp_service_buttons[service].values():
+            button.configure(state="disabled")
+
+        def worker():
+            error = None
+            desired_running = action == "start"
+            try:
+                if xampp_service_running(service) != desired_running:
+                    launch_xampp_service_script(root, service, action)
+                    for _ in range(30):
+                        time.sleep(0.5)
+                        if xampp_service_running(service) == desired_running:
+                            break
+                    else:
+                        verb = "start" if desired_running else "stop"
+                        raise RuntimeError(
+                            f"{label} did not {verb} within 15 seconds. Check the XAMPP logs for details."
+                        )
+            except Exception as exc:
+                error = str(exc)
+            self._ui(self._xampp_action_finished, service, action, error)
+        self._thread(worker)
+
+    def _xampp_action_finished(self, service, action, error):
+        label = XAMPP_SERVICES[service]["label"]
+        if error:
+            self.log(f"Could not {action} {label}: {error}")
+            self._alert(f"{label} {action} failed", error, True)
+        else:
+            self.log(f"{label} {action} completed.")
+            if service == "mysql":
+                if action == "start":
+                    self.root.after(250, self.refresh_databases)
+                else:
+                    self._set_connection(False, "MySQL stopped")
+        self.refresh_xampp_services()
 
     @staticmethod
     def _format_bytes(value):
