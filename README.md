@@ -10,7 +10,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Safe reconnect attempts after MySQL connection failures
 - Resume after reopening the app when the file and target connection have not changed
 - Database creation, search, selection, and protected deletion
-- Organized Apache and MySQL start/stop controls with live process status and clickable local URLs
+- Multi-XAMPP-aware Apache and MySQL controls with exact-installation status and clickable local URLs
 - Syntax-highlighted SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email, phone, and password column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
@@ -82,7 +82,7 @@ This local login protects against casual access to the application. The Windows 
 
 ## Database tools
 
-- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Stopping MySQL is blocked while an import is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
+- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while an import is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
 - **Delete selected** requires the exact database name. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
 - **Sanitizer** accepts multiple comma-separated column names for email, phone, and password (for example, `email, email_address, work_email`). Only exact full-name, case-insensitive matches are listed and updated, and every match in a category receives that category's single replacement value. Replacements are permanent, so retain the original dump.

@@ -50,6 +50,22 @@ class XamppServiceTests(unittest.TestCase):
         run.return_value.stderr = ""
         self.assertTrue(xampp_service_running("mysql"))
 
+    @patch("app_ui.subprocess.run")
+    def test_selected_xampp_uses_exact_executable_path(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = ""
+        run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable_dir = os.path.join(temp_dir, "mysql", "bin")
+            os.makedirs(executable_dir)
+            executable = os.path.join(executable_dir, "mysqld.exe")
+            with open(executable, "wb"):
+                pass
+            self.assertTrue(xampp_service_running("mysql", temp_dir))
+        call = run.call_args
+        self.assertEqual(os.path.normcase(executable), call.kwargs["env"]["XAMPP_SERVICE_TARGET"])
+        self.assertIn("Get-CimInstance", call.args[0][-1])
+
     @patch("app_ui.subprocess.Popen")
     def test_official_script_is_launched_without_a_visible_window(self, popen):
         with tempfile.TemporaryDirectory() as temp_dir:

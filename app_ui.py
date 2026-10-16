@@ -76,8 +76,37 @@ def xampp_root_from_mysql(mysql_executable: str) -> str:
     return root
 
 
-def xampp_service_running(service: str) -> bool:
+def xampp_service_running(service: str, root: str | None = None) -> bool:
     details = XAMPP_SERVICES[service]
+    if root:
+        relative_executable = (
+            os.path.join("apache", "bin", "httpd.exe")
+            if service == "apache"
+            else os.path.join("mysql", "bin", "mysqld.exe")
+        )
+        expected_path = os.path.normcase(os.path.abspath(os.path.join(root, relative_executable)))
+        if not os.path.isfile(expected_path):
+            return False
+        environment = os.environ.copy()
+        environment["XAMPP_SERVICE_TARGET"] = expected_path
+        process_name = details["process"].replace("'", "''")
+        command = (
+            "$target=[IO.Path]::GetFullPath($env:XAMPP_SERVICE_TARGET);"
+            f"$match=Get-CimInstance Win32_Process -Filter \"Name='{process_name}'\" "
+            "-ErrorAction Stop | Where-Object { $_.ExecutablePath -and "
+            "([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target) };"
+            "if ($match) { exit 0 } else { exit 3 }"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=12, env=environment,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 3:
+            return False
+        raise RuntimeError((result.stderr or "Could not check the selected XAMPP process.").strip())
     result = subprocess.run(
         ["tasklist", "/FI", f"IMAGENAME eq {details['process']}", "/FO", "CSV", "/NH"],
         capture_output=True, text=True, timeout=8, creationflags=CREATE_NO_WINDOW,
@@ -885,7 +914,9 @@ class ModernApp:
                 "Use Start and Stop to control Apache and MySQL. Refresh status checks whether httpd.exe and "
                 "mysqld.exe are running. Save settings stores the MySQL path, host, port, and user, but never "
                 "the MySQL password. Quick links open the local index when Apache is running and phpMyAdmin when "
-                "both Apache and MySQL are running.\n\n"
+                "both Apache and MySQL are running. If multiple XAMPP versions are installed, the service status "
+                "and Start/Stop actions apply to the installation containing the selected mysql.exe. Each running "
+                "installation must use its own Apache and MySQL ports.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
                 "Delete selected permanently removes the selected database after exact-name confirmation. "
                 "MySQL cannot be stopped while an import is active.",
@@ -1095,7 +1126,7 @@ class ModernApp:
 
         def worker():
             try:
-                statuses = {service: xampp_service_running(service) for service in XAMPP_SERVICES}
+                statuses = {service: xampp_service_running(service, root) for service in XAMPP_SERVICES}
                 self._ui(self._apply_xampp_service_statuses, statuses)
             except Exception as exc:
                 self._ui(self._xampp_status_failed, str(exc), notify)
@@ -1182,11 +1213,11 @@ class ModernApp:
             error = None
             desired_running = action == "start"
             try:
-                if xampp_service_running(service) != desired_running:
+                if xampp_service_running(service, root) != desired_running:
                     launch_xampp_service_script(root, service, action)
-                    for _ in range(30):
-                        time.sleep(0.5)
-                        if xampp_service_running(service) == desired_running:
+                    for _ in range(15):
+                        time.sleep(1)
+                        if xampp_service_running(service, root) == desired_running:
                             break
                     else:
                         verb = "start" if desired_running else "stop"
