@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import ctypes
 import os
+import re
 import sys
 import threading
 import time
@@ -31,6 +32,23 @@ PRIMARY, PRIMARY_DARK = "#4F46E5", "#4338CA"
 TEXT, MUTED, BORDER = "#111827", "#6B7280", "#E5E7EB"
 SUCCESS, DANGER = "#059669", "#DC2626"
 IDLE_LOGOUT_SECONDS = 15 * 60
+
+SQL_KEYWORDS = (
+    "ADD|ALL|ALTER|AND|AS|ASC|BETWEEN|BY|CASE|COLUMN|CONSTRAINT|CREATE|CROSS|"
+    "DATABASE|DEFAULT|DELETE|DESC|DISTINCT|DROP|ELSE|END|EXISTS|FOREIGN|FROM|"
+    "FULL|GROUP|HAVING|IN|INDEX|INNER|INSERT|INTO|IS|JOIN|KEY|LEFT|LIKE|LIMIT|"
+    "NOT|NULL|OFFSET|ON|OR|ORDER|OUTER|PRIMARY|PROCEDURE|REFERENCES|RENAME|"
+    "REPLACE|RIGHT|SELECT|SET|SHOW|TABLE|THEN|TRUNCATE|UNION|UNIQUE|UPDATE|"
+    "USE|VALUES|VIEW|WHEN|WHERE|WITH"
+)
+SQL_TOKEN_PATTERN = re.compile(
+    rf"(?P<comment>--[^\n]*|\#[^\n]*|/\*[\s\S]*?\*/)"
+    rf"|(?P<string>'(?:''|\\.|[^'\\])*'|\"(?:\"\"|\\.|[^\"\\])*\")"
+    rf"|(?P<identifier>`(?:``|[^`])*`)"
+    rf"|(?P<number>\b(?:0x[0-9a-f]+|\d+(?:\.\d+)?)\b)"
+    rf"|(?P<keyword>\b(?:{SQL_KEYWORDS})\b)",
+    re.IGNORECASE,
+)
 
 
 def parse_column_names(value: str) -> list[str]:
@@ -125,6 +143,7 @@ class ModernApp:
         self.auth = LocalAuth()
         self.authenticated = False
         self.last_activity = time.monotonic()
+        self.query_highlight_job = None
 
         self._load_config()
         if not self.mysql_path.get():
@@ -570,10 +589,32 @@ class ModernApp:
         ttk.Label(actions, text="Ctrl+Enter", style="Muted.TLabel").pack(side="right", padx=(0, 10))
         self.run_query_button = ttk.Button(actions, text="Execute SQL", style="Primary.TButton", command=self.run_query)
         self.run_query_button.pack(side="right")
-        self.query_editor = tk.Text(editor, height=8, wrap="none", undo=True, bg="#FBFCFE", fg=TEXT,
-                                    insertbackground=TEXT, bd=0, highlightthickness=1, highlightbackground=BORDER,
-                                    font=(self.font_family, 10), padx=12, pady=12)
-        self.query_editor.pack(fill="both", expand=True)
+        ttk.Button(actions, text="Clear editor", command=self.clear_query_editor).pack(side="right", padx=(0, 8))
+        editor_wrap = tk.Frame(editor, bg=SURFACE)
+        editor_wrap.pack(fill="both", expand=True)
+        editor_wrap.grid_rowconfigure(0, weight=1)
+        editor_wrap.grid_columnconfigure(0, weight=1)
+        self.query_editor = tk.Text(
+            editor_wrap, height=8, wrap="none", undo=True, bg="#FBFCFE", fg=TEXT,
+            insertbackground=TEXT, bd=0, highlightthickness=1, highlightbackground=BORDER,
+            font=("Consolas", 10), padx=12, pady=12,
+        )
+        query_y_scroll = ttk.Scrollbar(editor_wrap, orient="vertical", command=self.query_editor.yview)
+        query_x_scroll = ttk.Scrollbar(editor_wrap, orient="horizontal", command=self.query_editor.xview)
+        self.query_editor.configure(
+            yscrollcommand=query_y_scroll.set,
+            xscrollcommand=query_x_scroll.set,
+        )
+        self.query_editor.grid(row=0, column=0, sticky="nsew")
+        query_y_scroll.grid(row=0, column=1, sticky="ns")
+        query_x_scroll.grid(row=1, column=0, sticky="ew")
+        self.query_editor.tag_configure("sql_keyword", foreground="#4F46E5", font=("Consolas", 10, "bold"))
+        self.query_editor.tag_configure("sql_string", foreground="#047857")
+        self.query_editor.tag_configure("sql_comment", foreground="#6B7280", font=("Consolas", 10, "italic"))
+        self.query_editor.tag_configure("sql_number", foreground="#B45309")
+        self.query_editor.tag_configure("sql_identifier", foreground="#0369A1")
+        self.query_editor.bind("<<Modified>>", self._on_query_editor_modified)
+        self.query_editor.edit_modified(False)
         self.query_editor.bind("<Control-Return>", lambda _event: (self.run_query(), "break")[1])
         results = self._card(body, "Results")
         results.grid(row=2, column=0, sticky="nsew")
@@ -587,6 +628,35 @@ class ModernApp:
         xscroll.grid(row=1, column=0, sticky="ew")
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
+
+    def _on_query_editor_modified(self, _event=None):
+        if not self.query_editor.edit_modified():
+            return
+        self.query_editor.edit_modified(False)
+        if self.query_highlight_job is not None:
+            self.root.after_cancel(self.query_highlight_job)
+        self.query_highlight_job = self.root.after(80, self._highlight_query_editor)
+
+    def _highlight_query_editor(self):
+        self.query_highlight_job = None
+        text = self.query_editor.get("1.0", "end-1c")
+        for tag in ("sql_keyword", "sql_string", "sql_comment", "sql_number", "sql_identifier"):
+            self.query_editor.tag_remove(tag, "1.0", "end")
+        tag_names = {
+            "keyword": "sql_keyword",
+            "string": "sql_string",
+            "comment": "sql_comment",
+            "number": "sql_number",
+            "identifier": "sql_identifier",
+        }
+        for match in SQL_TOKEN_PATTERN.finditer(text):
+            tag = tag_names[match.lastgroup]
+            self.query_editor.tag_add(tag, f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+    def clear_query_editor(self):
+        self.query_editor.delete("1.0", "end")
+        self.query_status.set("Ready")
+        self.query_editor.focus_set()
 
     def _build_sanitize_page(self):
         page = self._new_page("Sanitizer")

@@ -10,7 +10,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Safe reconnect attempts after MySQL connection failures
 - Resume after reopening the app when the file and target connection have not changed
 - Database creation, search, selection, and protected deletion
-- SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
+- Syntax-highlighted SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email, phone, and password column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
 - Single-administrator login, logout, failed-attempt lockout, and idle auto-lock
@@ -68,7 +68,7 @@ The parser supports standard phpMyAdmin/mysqldump schema and data exports, inclu
 
 ## Local administrator login
 
-The first launch asks you to create one administrator password with at least eight characters. The app stores only a randomly salted PBKDF2-SHA256 hash in `~/.xampp_sql_importer/auth.json`; it never stores the original password.
+The first launch asks you to create one administrator password with at least four characters. The app stores only a randomly salted PBKDF2-SHA256 hash in `~/.xampp_sql_importer/auth.json`; it never stores the original password.
 
 - Five failed attempts trigger a persistent timed lockout.
 - **Logout** is always available in the header.

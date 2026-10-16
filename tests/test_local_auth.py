@@ -30,7 +30,9 @@ class LocalAuthTests(unittest.TestCase):
 
     def test_minimum_password_length(self):
         with self.assertRaises(AuthError):
-            self.auth.setup("short")
+            self.auth.setup("abc")
+        self.auth.setup("abcd")
+        self.assertEqual((True, 0), self.auth.verify("abcd"))
 
     def test_five_failures_trigger_persistent_lockout(self):
         self.auth.setup("correct password")

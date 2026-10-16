@@ -15,7 +15,7 @@ import time
 AUTH_DIR = os.path.join(os.path.expanduser("~"), ".xampp_sql_importer")
 AUTH_FILE = os.path.join(AUTH_DIR, "auth.json")
 PBKDF2_ITERATIONS = 600_000
-MIN_PASSWORD_LENGTH = 8
+MIN_PASSWORD_LENGTH = 4
 
 
 class AuthError(RuntimeError):
