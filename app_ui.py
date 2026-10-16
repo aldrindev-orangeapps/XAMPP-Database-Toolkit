@@ -41,6 +41,8 @@ XAMPP_SERVICES = {
     "mysql": {"process": "mysqld.exe", "label": "MySQL"},
 }
 NAVIGATION_PAGES = ("Databases", "Import", "Sanitizer", "SQL Console", "Logs", "User Manual")
+PRIVATE_FONT_FLAG = 0x10
+_registered_font_paths: list[str] = []
 
 SQL_KEYWORDS = (
     "ADD|ALL|ALTER|AND|AS|ASC|BETWEEN|BY|CASE|COLUMN|CONSTRAINT|CREATE|CROSS|"
@@ -227,12 +229,24 @@ def register_poppins() -> str:
             path = resource_path(os.path.join("assets", "fonts", filename))
             if os.path.isfile(path):
                 try:
-                    loaded += bool(ctypes.windll.gdi32.AddFontResourceExW(path, 0x10, 0))
+                    if ctypes.windll.gdi32.AddFontResourceExW(path, PRIVATE_FONT_FLAG, 0):
+                        _registered_font_paths.append(path)
+                        loaded += 1
                 except (AttributeError, OSError):
                     pass
         if loaded:
             return "Poppins"
     return "Segoe UI"
+
+
+def unregister_poppins() -> None:
+    """Release private fonts before PyInstaller removes its one-file temp folder."""
+    while _registered_font_paths:
+        path = _registered_font_paths.pop()
+        try:
+            ctypes.windll.gdi32.RemoveFontResourceExW(path, PRIVATE_FONT_FLAG, 0)
+        except (AttributeError, OSError):
+            pass
 
 
 class ModernApp:
@@ -1804,5 +1818,13 @@ def run_app():
         except (AttributeError, OSError):
             pass
     root = tk.Tk()
-    ModernApp(root)
-    root.mainloop()
+    try:
+        ModernApp(root)
+        root.mainloop()
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+        unregister_poppins()
