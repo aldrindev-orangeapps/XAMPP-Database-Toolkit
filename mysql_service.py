@@ -127,6 +127,91 @@ class MySQLService:
         return [line.strip() for line in result.stdout.splitlines()
                 if line.strip() and line.strip().lower() not in SYSTEM_DATABASES]
 
+    def copy_database(self, source: str, destination: str) -> None:
+        """Stream one database through mysqldump into another database."""
+        cfg = self.config()
+        dump_executable = os.path.join(os.path.dirname(cfg.executable), "mysqldump.exe")
+        if not os.path.isfile(dump_executable):
+            raise FileNotFoundError(
+                "mysqldump.exe was not found beside mysql.exe in the selected XAMPP folder."
+            )
+        dump_command = [
+            dump_executable,
+            "--host", cfg.host or "127.0.0.1",
+            "--port", cfg.port or "3306",
+            "--user", cfg.user or "root",
+            "--default-character-set=utf8mb4",
+            "--single-transaction",
+            "--quick",
+            "--routines",
+            "--events",
+            "--triggers",
+            "--hex-blob",
+            "--",
+            source,
+        ]
+        dump_environment = os.environ.copy()
+        if cfg.password:
+            dump_environment["MYSQL_PWD"] = cfg.password
+        else:
+            dump_environment.pop("MYSQL_PWD", None)
+        restore_command, restore_environment = self.command(destination)
+
+        dump_process = subprocess.Popen(
+            dump_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dump_environment,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        assert dump_process.stdout is not None
+        try:
+            restore_process = subprocess.Popen(
+                restore_command,
+                stdin=dump_process.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=restore_environment,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception:
+            dump_process.kill()
+            dump_process.wait()
+            raise
+        finally:
+            dump_process.stdout.close()
+
+        def drain_error(stream, output: bytearray) -> None:
+            if stream is None:
+                return
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                if len(output) < 65_536:
+                    output.extend(chunk[:65_536 - len(output)])
+
+        dump_error, restore_error = bytearray(), bytearray()
+        dump_error_thread = threading.Thread(
+            target=drain_error, args=(dump_process.stderr, dump_error), daemon=True,
+        )
+        restore_error_thread = threading.Thread(
+            target=drain_error, args=(restore_process.stderr, restore_error), daemon=True,
+        )
+        dump_error_thread.start()
+        restore_error_thread.start()
+        dump_return_code = dump_process.wait()
+        restore_return_code = restore_process.wait()
+        dump_error_thread.join()
+        restore_error_thread.join()
+
+        if dump_return_code:
+            detail = dump_error.decode("utf-8", "replace").strip()
+            raise MySQLError(detail or f"mysqldump.exe exited with code {dump_return_code}.")
+        if restore_return_code:
+            detail = restore_error.decode("utf-8", "replace").strip()
+            raise MySQLError(detail or f"mysql.exe exited with code {restore_return_code}.")
+
     def execute_query(self, sql: str, database: str, read_only: bool, max_rows: int = 1000) -> QueryResult:
         marker = "__xsi_affected_rows__"
         combined = f"{sql.rstrip().rstrip(';')};\nSELECT ROW_COUNT() AS `{marker}`;"

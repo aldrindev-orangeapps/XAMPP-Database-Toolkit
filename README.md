@@ -1,6 +1,6 @@
 # XAMPP Database Toolkit
 
-A modern Windows desktop tool for importing large SQL dumps, managing local XAMPP databases, running SQL, and sanitizing development data. The interface uses the bundled **Poppins** font and only requires `mysql.exe` at runtime.
+A modern Windows desktop tool for importing large SQL dumps, managing local XAMPP databases, running SQL, and sanitizing development data. The interface uses the bundled **Poppins** font and XAMPP's standard database command-line tools.
 
 ## Features
 
@@ -9,7 +9,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Live transfer speed, elapsed time, and estimated remaining time during imports
 - Safe reconnect attempts after MySQL connection failures
 - Resume after reopening the app when the file and target connection have not changed
-- Database creation, search, selection, and protected deletion
+- Database creation, streaming copy, search, selection, and protected deletion
 - Multi-XAMPP-aware Apache and MySQL controls with exact-installation status and clickable local URLs
 - Syntax-highlighted SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email, phone, and password column scanner/sanitizer
@@ -23,7 +23,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 ## Requirements
 
 - Windows with XAMPP/MySQL or MariaDB installed
-- `mysql.exe`, normally at `C:\xampp\mysql\bin\mysql.exe`
+- `mysql.exe` and `mysqldump.exe`, normally under `C:\xampp\mysql\bin`
 - Python 3 only when running from source or building the EXE
 
 ## Run from source
@@ -74,7 +74,7 @@ The first launch asks you to create one administrator password with at least fou
 
 - Five failed attempts trigger a persistent timed lockout.
 - **Logout** is always available in the header.
-- An inactive session automatically locks after 15 minutes. An active import is allowed to reach a safe state before auto-locking.
+- An inactive session automatically locks after 15 minutes. Idle locking is paused throughout an active import or database copy, and the 15-minute countdown restarts afterward.
 - Logging out clears the in-memory MySQL password and selected database.
 - The administrator password can be changed from **Databases → Change app password**.
 
@@ -83,7 +83,8 @@ This local login protects against casual access to the application. The Windows 
 ## Database tools
 
 - **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while an import is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
-- **Delete selected** requires the exact database name. MySQL system databases are hidden and protected.
+- **Copy selected** duplicates the selected source database into a new destination using a bounded-memory `mysqldump.exe` to `mysql.exe` stream. Existing databases are never overwritten, and a newly created partial destination is removed if copying fails.
+- **Delete selected** shows a permanent-deletion warning with a dedicated confirmation button. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
 - **Sanitizer** accepts multiple comma-separated column names for email, phone, and password (for example, `email, email_address, work_email`). Only exact full-name, case-insensitive matches are listed and updated, and every match in a category receives that category's single replacement value. Replacements are permanent, so retain the original dump.
 - Detected password columns can be reset across every row to `c4ca4238a0b923820dcc509a6f75849b`, whose default login value is `1`.

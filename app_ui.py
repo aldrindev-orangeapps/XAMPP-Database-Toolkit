@@ -281,6 +281,8 @@ class ModernApp:
         self.sanitize_status = tk.StringVar(value="Scan a database to find personal data columns.")
         self.databases, self.sanitize_columns = [], []
         self.importer = None
+        self.import_active = False
+        self.database_copy_active = False
         self.import_cancel = threading.Event()
         self.import_started = 0.0
         self.after_import_action = None
@@ -473,7 +475,13 @@ class ModernApp:
     def logout(self, automatic=False):
         if not self.authenticated:
             return
-        if self.importer:
+        if self.database_copy_active:
+            if automatic:
+                self.last_activity = time.monotonic()
+            else:
+                self._alert("Copy in progress", "Wait for the database copy to finish before logging out.")
+            return
+        if self._import_is_active():
             if automatic:
                 self.last_activity = time.monotonic()
                 return
@@ -504,9 +512,17 @@ class ModernApp:
         if self.authenticated:
             self.last_activity = time.monotonic()
 
+    def _import_is_active(self) -> bool:
+        """Include the short setup/cleanup windows around an import worker."""
+        return self.import_active or self.importer is not None
+
     def _check_idle_logout(self):
-        if self.authenticated and time.monotonic() - self.last_activity >= IDLE_LOGOUT_SECONDS:
-            self.logout(automatic=True)
+        if self.authenticated:
+            now = time.monotonic()
+            if self._import_is_active() or self.database_copy_active:
+                self.last_activity = now
+            elif now - self.last_activity >= IDLE_LOGOUT_SECONDS:
+                self.logout(automatic=True)
         self.root.after(30_000, self._check_idle_logout)
 
     def _build_shell(self):
@@ -761,6 +777,8 @@ class ModernApp:
         self.create_db_button.pack(side="right")
         self.delete_db_button = ttk.Button(toolbar, text="Delete selected", style="Danger.TButton", command=self.delete_database)
         self.delete_db_button.pack(side="right", padx=8)
+        self.copy_db_button = ttk.Button(toolbar, text="Copy selected", command=self.copy_database)
+        self.copy_db_button.pack(side="right")
         self.database_busy_bar = ttk.Progressbar(dbcard, mode="indeterminate")
         list_wrap = ttk.Frame(dbcard, style="Card.TFrame")
         list_wrap.pack(fill="both", expand=True)
@@ -963,7 +981,8 @@ class ModernApp:
                 "and Start/Stop actions apply to the installation containing the selected mysql.exe. Each running "
                 "installation must use its own Apache and MySQL ports.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
-                "Delete selected permanently removes the selected database after exact-name confirmation. "
+                "Copy selected duplicates the selected source into a new database without overwriting existing data. "
+                "Delete selected permanently removes the selected database after you confirm the warning. "
                 "MySQL cannot be stopped while an import is active.",
             ),
             (
@@ -993,7 +1012,8 @@ class ModernApp:
                 "Logs, login, and safety",
                 "Logs records connection, import, SQL, sanitizer, and service activity for the current session. "
                 "Use Change app password under Databases to update the administrator password; the minimum is four "
-                "characters. Five failed attempts trigger a timed lockout, and an inactive session locks after 15 minutes.\n\n"
+                "characters. Five failed attempts trigger a timed lockout, and an inactive session locks after 15 minutes. "
+                "Idle locking is paused throughout an active import or database copy and restarts afterward.\n\n"
                 "Always keep a backup before deleting databases or sanitizing data. Do not close XAMPP or stop MySQL "
                 "during an active import.",
             ),
@@ -1081,10 +1101,10 @@ class ModernApp:
     def _alert(self, title, message, danger=False):
         self._dialog(title, message, [("OK", True, "Danger.TButton" if danger else "Primary.TButton")], danger)
 
-    def _confirm(self, title, message, danger=False):
+    def _confirm(self, title, message, danger=False, confirm_label="Continue"):
         return bool(self._dialog(title, message, [
             ("Cancel", False, "TButton"),
-            ("Continue", True, "Danger.TButton" if danger else "Primary.TButton"),
+            (confirm_label, True, "Danger.TButton" if danger else "Primary.TButton"),
         ], danger))
 
     def change_app_password(self):
@@ -1234,8 +1254,9 @@ class ModernApp:
 
     def control_xampp_service(self, service, action):
         label = XAMPP_SERVICES[service]["label"]
-        if action == "stop" and service == "mysql" and self.importer:
-            self._alert("Import in progress", "Stop the active import before stopping MySQL.", True)
+        if action == "stop" and service == "mysql" and (self._import_is_active() or self.database_copy_active):
+            operation = "import" if self._import_is_active() else "database copy"
+            self._alert("Database work in progress", f"Wait for the active {operation} before stopping MySQL.", True)
             return
         if action == "stop" and not self._confirm(
             f"Stop {label}",
@@ -1353,7 +1374,10 @@ class ModernApp:
         state = "disabled" if busy else "normal"
         self.refresh_db_button.configure(state=state)
         self.create_db_button.configure(state=state)
-        self.delete_db_button.configure(state=state, text="Deleting…" if busy else "Delete selected")
+        deleting = busy and message.startswith("Deleting ")
+        copying = busy and message.startswith("Copying ")
+        self.delete_db_button.configure(state=state, text="Deleting…" if deleting else "Delete selected")
+        self.copy_db_button.configure(state=state, text="Copying…" if copying else "Copy selected")
         self.db_list.configure(state=state)
         self.database_status.set(message)
         if busy:
@@ -1395,7 +1419,7 @@ class ModernApp:
         self._thread(worker)
 
     def delete_database(self):
-        if self.importer:
+        if self._import_is_active():
             self._alert("Import in progress", "Stop the active import before deleting a database.", True)
             return
         name = self.selected_db.get()
@@ -1405,17 +1429,20 @@ class ModernApp:
         if name.lower() in SYSTEM_DATABASES:
             self._alert("Protected database", "MySQL system databases cannot be deleted here.", True)
             return
-        typed = simpledialog.askstring("Delete database", f"Type {name} to permanently delete it:", parent=self.root)
-        if typed != name:
-            if typed is not None:
-                self._alert("Name did not match", "The database was not deleted.")
+        if not self._confirm(
+            "Delete database",
+            f"Permanently delete the database '{name}'?\n\nThis cannot be undone.",
+            True,
+            confirm_label="Delete database",
+        ):
             return
         self._sync_config()
         config = self._mysql_config()
         self._set_database_busy(True, f"Deleting {name}…")
         def worker():
             try:
-                self.service.run(["-e", f"DROP DATABASE `{name}`;"])
+                quoted_name = name.replace("`", "``")
+                self.service.run(["-e", f"DROP DATABASE `{quoted_name}`;"])
             except Exception as exc:
                 self._ui(self._delete_database_finished, name, str(exc), 0, None)
                 return
@@ -1430,6 +1457,103 @@ class ModernApp:
                 self.log(f"Removed {removed} stale import checkpoint(s) for {name}.")
             self._ui(self._delete_database_finished, name, None, removed, checkpoint_warning)
         self._thread(worker)
+
+    def copy_database(self):
+        if self.database_copy_active:
+            return
+        if self._import_is_active():
+            self._alert("Import in progress", "Stop the active import before copying a database.", True)
+            return
+        source = self.selected_db.get()
+        if not source:
+            self._alert("No source database", "Select the database you want to copy first.")
+            return
+        destination = simpledialog.askstring(
+            "Copy database",
+            f"Source database: {source}\n\nNew destination database name:",
+            initialvalue=f"{source}_copy",
+            parent=self.root,
+        )
+        if destination is None:
+            return
+        destination = destination.strip()
+        if not destination or not all(char.isalnum() or char in "_$" for char in destination):
+            self._alert("Invalid name", "Use letters, numbers, underscore, or dollar sign only.")
+            return
+        if len(destination) > 64:
+            self._alert("Invalid name", "A database name cannot exceed 64 characters.")
+            return
+        if destination.casefold() in {name.casefold() for name in self.databases}:
+            self._alert(
+                "Destination already exists",
+                "Choose a new database name. Existing databases are never overwritten by Copy.",
+                True,
+            )
+            return
+        if not self._confirm(
+            "Copy database",
+            f"Copy all tables and data from\n\n{source}\n\nto the new database\n\n{destination}?",
+            confirm_label="Copy database",
+        ):
+            return
+
+        self._sync_config()
+        self.database_copy_active = True
+        self._set_database_busy(True, f"Copying {source} to {destination}…")
+
+        def worker():
+            created = False
+            cleanup_error = None
+            try:
+                quoted_destination = destination.replace("`", "``")
+                self.service.run([
+                    "-e", f"CREATE DATABASE `{quoted_destination}` CHARACTER SET utf8mb4;",
+                ])
+                created = True
+                self.service.copy_database(source, destination)
+            except Exception as exc:
+                if created:
+                    try:
+                        self.service.run(["-e", f"DROP DATABASE `{quoted_destination}`;"])
+                    except Exception as cleanup_exc:
+                        cleanup_error = str(cleanup_exc)
+                self._ui(
+                    self._copy_database_finished,
+                    source,
+                    destination,
+                    str(exc),
+                    cleanup_error,
+                )
+                return
+            self.log(f"Copied database {source} to {destination}.")
+            self._ui(self._copy_database_finished, source, destination, None, None)
+
+        self._thread(worker)
+
+    def _copy_database_finished(self, source, destination, error, cleanup_error):
+        self.database_copy_active = False
+        self.last_activity = time.monotonic()
+        if error:
+            self._set_database_busy(False, "Copy failed")
+            cleanup_note = (
+                f"\n\nThe incomplete destination could not be removed: {cleanup_error}"
+                if cleanup_error else "\n\nNo incomplete destination was kept."
+            )
+            self.log(f"Database copy failed: {error}")
+            self._alert("Copy failed", error + cleanup_note, True)
+            self.refresh_databases()
+            return
+        if destination not in self.databases:
+            self.databases.append(destination)
+            self.databases.sort(key=str.casefold)
+        self.selected_db.set(destination)
+        self._filter_databases()
+        self._set_database_busy(False, f"Copied {source} to {destination}")
+        self._alert(
+            "Database copied",
+            f"{source} was copied successfully to {destination}.",
+        )
+        self.refresh_databases()
 
     def _delete_database_finished(self, name, error, removed_checkpoints=0, checkpoint_warning=None):
         if error:
@@ -1450,6 +1574,9 @@ class ModernApp:
         self.refresh_databases()
 
     def start_import(self):
+        if self.database_copy_active:
+            self._alert("Copy in progress", "Wait for the database copy to finish before starting an import.")
+            return
         path, database = self.sql_file.get(), self.selected_db.get()
         if not database or not path or not os.path.isfile(path):
             self._alert("Missing information", "Select a database and a valid SQL file first.")
@@ -1482,6 +1609,7 @@ class ModernApp:
                 self.log(f"Discarded the saved checkpoint for {database}; starting from byte 0.")
         continue_on_error = self.continue_on_error.get()
         self.import_cancel.clear()
+        self.import_active = True
         self.import_started = time.monotonic()
         self.import_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
@@ -1565,6 +1693,8 @@ class ModernApp:
         self.import_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self.importer = None
+        self.import_active = False
+        self.last_activity = time.monotonic()
         if pending_action == "close":
             self.save_config(notify=False)
             self.root.destroy()
@@ -1792,6 +1922,9 @@ class ModernApp:
             self._alert("Settings saved", "Connection settings were saved. The password was not stored.")
 
     def on_close(self):
+        if self.database_copy_active:
+            self._alert("Copy in progress", "Wait for the database copy to finish before closing the app.")
+            return
         if self.importer:
             if not self._confirm(
                 "Import in progress",
