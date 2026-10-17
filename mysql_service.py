@@ -127,6 +127,21 @@ class MySQLService:
         return [line.strip() for line in result.stdout.splitlines()
                 if line.strip() and line.strip().lower() not in SYSTEM_DATABASES]
 
+    def database_is_empty(self, database: str) -> bool:
+        """Return whether a schema contains no tables, views, routines, or events."""
+        schema_value = f"CONVERT(0x{database.encode('utf-8').hex()} USING utf8mb4)"
+        query = (
+            "SELECT "
+            f"(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA={schema_value}) + "
+            f"(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA={schema_value}) + "
+            f"(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA={schema_value});"
+        )
+        result = self.run(["-N", "-B", "-e", query], timeout=30)
+        try:
+            return int(result.stdout.strip()) == 0
+        except ValueError as exc:
+            raise MySQLError("MySQL did not return a valid destination object count.") from exc
+
     def copy_database(self, source: str, destination: str) -> None:
         """Stream one database through mysqldump into another database."""
         cfg = self.config()

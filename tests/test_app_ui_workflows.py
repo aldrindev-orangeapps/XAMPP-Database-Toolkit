@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 from app_ui import IDLE_LOGOUT_SECONDS, ModernApp
 from mysql_service import MySQLConfig
@@ -47,20 +47,20 @@ class AppUiWorkflowTests(unittest.TestCase):
 
         app._sync_config.assert_not_called()
 
-    @patch("app_ui.simpledialog.askstring", return_value="source_copy")
-    def test_database_copy_creates_new_destination_and_streams_data(self, _askstring):
+    def test_database_copy_streams_into_selected_empty_destination(self):
         app = ModernApp.__new__(ModernApp)
         app.importer = None
         app.import_active = False
         app.database_copy_active = False
-        app.databases = ["source"]
+        app.databases = ["source", "destination"]
         app.selected_db = Mock()
         app.selected_db.get.return_value = "source"
-        app.root = Mock()
+        app._choose_copy_destination = Mock(return_value="destination")
         app._confirm = Mock(return_value=True)
         app._sync_config = Mock()
         app._set_database_busy = Mock()
         app.service = Mock()
+        app.service.database_is_empty.return_value = True
         app.log = Mock()
         app._copy_database_finished = Mock()
         app._ui = lambda callback, *args: callback(*args)
@@ -68,46 +68,54 @@ class AppUiWorkflowTests(unittest.TestCase):
 
         app.copy_database()
 
-        app.service.run.assert_called_once_with([
-            "-e", "CREATE DATABASE `source_copy` CHARACTER SET utf8mb4;",
-        ])
-        app.service.copy_database.assert_called_once_with("source", "source_copy")
+        app.service.copy_database.assert_called_once_with("source", "destination")
         app._copy_database_finished.assert_called_once_with(
-            "source", "source_copy", None, None,
+            "source", "destination", None, False,
         )
 
-    @patch("app_ui.simpledialog.askstring", return_value="existing")
-    def test_database_copy_never_overwrites_existing_destination(self, _askstring):
+    def test_database_copy_never_overwrites_nonempty_destination(self):
         app = ModernApp.__new__(ModernApp)
         app.importer = None
         app.import_active = False
         app.database_copy_active = False
-        app.databases = ["source", "Existing"]
+        app.databases = ["source", "destination"]
         app.selected_db = Mock()
         app.selected_db.get.return_value = "source"
-        app.root = Mock()
-        app._alert = Mock()
-        app._confirm = Mock()
-
-        app.copy_database()
-
-        app._alert.assert_called_once()
-        app._confirm.assert_not_called()
-
-    @patch("app_ui.simpledialog.askstring", return_value="source_copy")
-    def test_failed_database_copy_removes_partial_destination(self, _askstring):
-        app = ModernApp.__new__(ModernApp)
-        app.importer = None
-        app.import_active = False
-        app.database_copy_active = False
-        app.databases = ["source"]
-        app.selected_db = Mock()
-        app.selected_db.get.return_value = "source"
-        app.root = Mock()
+        app._choose_copy_destination = Mock(return_value="destination")
         app._confirm = Mock(return_value=True)
         app._sync_config = Mock()
         app._set_database_busy = Mock()
         app.service = Mock()
+        app.service.database_is_empty.return_value = False
+        app.log = Mock()
+        app._copy_database_finished = Mock()
+        app._ui = lambda callback, *args: callback(*args)
+        app._thread = lambda worker: worker()
+
+        app.copy_database()
+
+        app.service.copy_database.assert_not_called()
+        app._copy_database_finished.assert_called_once_with(
+            "source",
+            "destination",
+            "The destination database is not empty. Choose an empty database.",
+            False,
+        )
+
+    def test_failed_database_copy_warns_that_destination_may_be_partial(self):
+        app = ModernApp.__new__(ModernApp)
+        app.importer = None
+        app.import_active = False
+        app.database_copy_active = False
+        app.databases = ["source", "destination"]
+        app.selected_db = Mock()
+        app.selected_db.get.return_value = "source"
+        app._choose_copy_destination = Mock(return_value="destination")
+        app._confirm = Mock(return_value=True)
+        app._sync_config = Mock()
+        app._set_database_busy = Mock()
+        app.service = Mock()
+        app.service.database_is_empty.return_value = True
         app.service.copy_database.side_effect = RuntimeError("dump failed")
         app.log = Mock()
         app._copy_database_finished = Mock()
@@ -116,17 +124,8 @@ class AppUiWorkflowTests(unittest.TestCase):
 
         app.copy_database()
 
-        self.assertEqual(
-            [
-                call([
-                    "-e", "CREATE DATABASE `source_copy` CHARACTER SET utf8mb4;",
-                ]),
-                call(["-e", "DROP DATABASE `source_copy`;"]),
-            ],
-            app.service.run.call_args_list,
-        )
         app._copy_database_finished.assert_called_once_with(
-            "source", "source_copy", "dump failed", None,
+            "source", "destination", "dump failed", True,
         )
 
     @patch("app_ui.time.monotonic", return_value=IDLE_LOGOUT_SECONDS + 10)

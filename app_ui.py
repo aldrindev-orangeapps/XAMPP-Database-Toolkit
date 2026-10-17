@@ -981,9 +981,9 @@ class ModernApp:
                 "and Start/Stop actions apply to the installation containing the selected mysql.exe. Each running "
                 "installation must use its own Apache and MySQL ports.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
-                "Copy selected duplicates the selected source into a new database without overwriting existing data. "
+                "Copy selected duplicates the selected source into an existing empty destination database. "
                 "Delete selected permanently removes the selected database after you confirm the warning. "
-                "MySQL cannot be stopped while an import is active.",
+                "MySQL cannot be stopped while an import or database copy is active.",
             ),
             (
                 "Import SQL dumps",
@@ -1468,31 +1468,13 @@ class ModernApp:
         if not source:
             self._alert("No source database", "Select the database you want to copy first.")
             return
-        destination = simpledialog.askstring(
-            "Copy database",
-            f"Source database: {source}\n\nNew destination database name:",
-            initialvalue=f"{source}_copy",
-            parent=self.root,
-        )
-        if destination is None:
-            return
-        destination = destination.strip()
-        if not destination or not all(char.isalnum() or char in "_$" for char in destination):
-            self._alert("Invalid name", "Use letters, numbers, underscore, or dollar sign only.")
-            return
-        if len(destination) > 64:
-            self._alert("Invalid name", "A database name cannot exceed 64 characters.")
-            return
-        if destination.casefold() in {name.casefold() for name in self.databases}:
-            self._alert(
-                "Destination already exists",
-                "Choose a new database name. Existing databases are never overwritten by Copy.",
-                True,
-            )
+        destination = self._choose_copy_destination(source)
+        if not destination:
             return
         if not self._confirm(
             "Copy database",
-            f"Copy all tables and data from\n\n{source}\n\nto the new database\n\n{destination}?",
+            (f"Copy all tables and data from\n\n{source}\n\nto\n\n{destination}?\n\n"
+             "The destination must be empty. Existing data will never be overwritten."),
             confirm_label="Copy database",
         ):
             return
@@ -1502,42 +1484,90 @@ class ModernApp:
         self._set_database_busy(True, f"Copying {source} to {destination}…")
 
         def worker():
-            created = False
-            cleanup_error = None
+            copy_started = False
             try:
-                quoted_destination = destination.replace("`", "``")
-                self.service.run([
-                    "-e", f"CREATE DATABASE `{quoted_destination}` CHARACTER SET utf8mb4;",
-                ])
-                created = True
+                if not self.service.database_is_empty(destination):
+                    self._ui(
+                        self._copy_database_finished,
+                        source,
+                        destination,
+                        "The destination database is not empty. Choose an empty database.",
+                        False,
+                    )
+                    return
+                copy_started = True
                 self.service.copy_database(source, destination)
             except Exception as exc:
-                if created:
-                    try:
-                        self.service.run(["-e", f"DROP DATABASE `{quoted_destination}`;"])
-                    except Exception as cleanup_exc:
-                        cleanup_error = str(cleanup_exc)
                 self._ui(
                     self._copy_database_finished,
                     source,
                     destination,
                     str(exc),
-                    cleanup_error,
+                    copy_started,
                 )
                 return
             self.log(f"Copied database {source} to {destination}.")
-            self._ui(self._copy_database_finished, source, destination, None, None)
+            self._ui(self._copy_database_finished, source, destination, None, False)
 
         self._thread(worker)
 
-    def _copy_database_finished(self, source, destination, error, cleanup_error):
+    def _choose_copy_destination(self, source):
+        destinations = [name for name in self.databases if name.casefold() != source.casefold()]
+        if not destinations:
+            self._alert(
+                "No destination database",
+                "Create an empty destination database first, then try Copy selected again.",
+            )
+            return None
+        window = tk.Toplevel(self.root)
+        window.title("Copy database")
+        window.configure(bg=SURFACE)
+        window.resizable(False, False)
+        window.transient(self.root)
+        tk.Frame(window, bg=PRIMARY, height=5).pack(fill="x")
+        content = tk.Frame(window, bg=SURFACE, padx=28, pady=24)
+        content.pack(fill="both", expand=True)
+        tk.Label(content, text="Copy database", bg=SURFACE, fg=TEXT,
+                 font=(self.font_family, 13, "bold")).pack(anchor="w")
+        tk.Label(content, text="Source", bg=SURFACE, fg=MUTED,
+                 font=(self.font_family, 9)).pack(anchor="w", pady=(16, 4))
+        tk.Label(content, text=source, bg="#F9FAFB", fg=TEXT, anchor="w", padx=10, pady=8,
+                 highlightthickness=1, highlightbackground=BORDER).pack(fill="x")
+        tk.Label(content, text="Destination (must be empty)", bg=SURFACE, fg=MUTED,
+                 font=(self.font_family, 9)).pack(anchor="w", pady=(14, 4))
+        selected = tk.StringVar(value=destinations[0])
+        destination_box = ttk.Combobox(
+            content, textvariable=selected, values=destinations, state="readonly", width=40,
+        )
+        destination_box.pack(fill="x")
+        result = {"value": None}
+        actions = tk.Frame(content, bg=SURFACE)
+        actions.pack(fill="x", pady=(20, 0))
+
+        def choose(value):
+            result["value"] = value
+            window.destroy()
+
+        ttk.Button(actions, text="Cancel", command=lambda: choose(None)).pack(side="right")
+        ttk.Button(
+            actions, text="Select destination", style="Primary.TButton",
+            command=lambda: choose(selected.get()),
+        ).pack(side="right", padx=8)
+        window.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        destination_box.bind("<Return>", lambda _event: choose(selected.get()))
+        window.grab_set()
+        destination_box.focus_set()
+        self.root.wait_window(window)
+        return result["value"]
+
+    def _copy_database_finished(self, source, destination, error, may_be_partial):
         self.database_copy_active = False
         self.last_activity = time.monotonic()
         if error:
             self._set_database_busy(False, "Copy failed")
             cleanup_note = (
-                f"\n\nThe incomplete destination could not be removed: {cleanup_error}"
-                if cleanup_error else "\n\nNo incomplete destination was kept."
+                "\n\nThe destination may contain a partial copy. Delete and recreate it before retrying."
+                if may_be_partial else ""
             )
             self.log(f"Database copy failed: {error}")
             self._alert("Copy failed", error + cleanup_note, True)

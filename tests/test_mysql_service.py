@@ -18,6 +18,21 @@ class FakeProcess:
 
 
 class MySQLServiceCopyTests(unittest.TestCase):
+    def test_database_is_empty_counts_all_schema_objects_with_hex_name(self):
+        config = MySQLConfig("mysql.exe")
+        service = MySQLService(lambda: config)
+        service.run = Mock()
+        service.run.return_value.stdout = "0\n"
+
+        self.assertTrue(service.database_is_empty("client-db"))
+
+        extra = service.run.call_args.args[0]
+        self.assertEqual(["-N", "-B", "-e"], extra[:3])
+        self.assertIn("0x636c69656e742d6462", extra[3])
+        self.assertIn("information_schema.TABLES", extra[3])
+        self.assertIn("information_schema.ROUTINES", extra[3])
+        self.assertIn("information_schema.EVENTS", extra[3])
+
     @patch("mysql_service.subprocess.Popen")
     @patch("mysql_service.os.path.isfile", return_value=True)
     def test_copy_database_streams_dump_without_password_argument(self, _isfile, popen):

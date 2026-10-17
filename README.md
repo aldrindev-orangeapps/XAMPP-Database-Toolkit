@@ -82,8 +82,8 @@ This local login protects against casual access to the application. The Windows 
 
 ## Database tools
 
-- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while an import is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
-- **Copy selected** duplicates the selected source database into a new destination using a bounded-memory `mysqldump.exe` to `mysql.exe` stream. Existing databases are never overwritten, and a newly created partial destination is removed if copying fails.
+- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while an import or database copy is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
+- **Copy selected** lets you choose another existing database as the destination, then duplicates the selected source through a bounded-memory `mysqldump.exe` to `mysql.exe` stream. The destination must be empty, so existing data is never overwritten. Create the empty destination with **New database** first.
 - **Delete selected** shows a permanent-deletion warning with a dedicated confirmation button. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
 - **Sanitizer** accepts multiple comma-separated column names for email, phone, and password (for example, `email, email_address, work_email`). Only exact full-name, case-insensitive matches are listed and updated, and every match in a category receives that category's single replacement value. Replacements are permanent, so retain the original dump.
@@ -101,6 +101,7 @@ Connection settings are saved in `~/.xampp_sql_importer.ini`; the password is ne
 | Connection fails | Start MySQL in XAMPP and verify host, port, user, and password. |
 | A statement exceeds `max_allowed_packet` | Follow the displayed `my.ini` instruction, restart MySQL, then resume. |
 | Import pauses after a disconnect | Review the shown statement. Retry may duplicate it; skip only if you know it committed. |
+| Database copy is rejected | Create or select an empty destination database; Copy never overwrites existing objects. |
 | Dump uses `DELIMITER` | Export ordinary schema/data SQL without stored routines, or use a specialized client. |
 | Font falls back to Segoe UI | Rebuild with the spec so `assets\fonts` is included. |
 
