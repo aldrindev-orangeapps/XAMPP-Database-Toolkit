@@ -43,6 +43,19 @@ python -m PyInstaller --noconfirm ".\XAMPP Database Toolkit.spec"
 
 The result is written to `dist\XAMPP Database Toolkit.exe`.
 
+## Publish a GitHub release
+
+The `Build Windows release` GitHub Actions workflow runs whenever a tag beginning with `v` is pushed. It runs the complete test suite on Windows, builds the canonical PyInstaller spec, and publishes the EXE, a versioned ZIP package, and `SHA256SUMS.txt` on the matching GitHub Release.
+
+Commit and push the source changes before creating a release tag:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Use a new semantic version for each release, such as `v1.0.1` or `v1.1.0`. Re-running the workflow for an existing tag replaces its downloadable assets without creating a duplicate release.
+
 The spec includes the Poppins files from `assets\fonts`. To build without it:
 
 ```powershell

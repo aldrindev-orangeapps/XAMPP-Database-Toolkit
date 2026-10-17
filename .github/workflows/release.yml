@@ -1,0 +1,83 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Test, build, and publish
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install build tooling
+        shell: pwsh
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: python -m PyInstaller --noconfirm ".\XAMPP Database Toolkit.spec"
+
+      - name: Package release files
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $exe = "dist\XAMPP Database Toolkit.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Expected build output was not found: $exe"
+          }
+
+          $safeTag = $env:RELEASE_TAG -replace "[^A-Za-z0-9._-]", "-"
+          $zip = "dist\XAMPP-Database-Toolkit-$safeTag-windows-x64.zip"
+          Compress-Archive -LiteralPath $exe -DestinationPath $zip -Force
+
+          $checksumFiles = @($exe, $zip)
+          $checksums = foreach ($file in $checksumFiles) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          $checksums | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
+          "zip_path=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ZIP_PATH: ${{ steps.package.outputs.zip_path }}
+        run: |
+          $assets = @(
+            "dist\XAMPP Database Toolkit.exe",
+            $env:ZIP_PATH,
+            "dist\SHA256SUMS.txt"
+          )
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG @assets --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:RELEASE_TAG @assets `
+              --verify-tag `
+              --generate-notes `
+              --title "XAMPP Database Toolkit $env:RELEASE_TAG" `
+              --repo $env:GITHUB_REPOSITORY
+          }
