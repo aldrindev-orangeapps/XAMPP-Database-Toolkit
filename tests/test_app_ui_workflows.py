@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -236,6 +237,95 @@ class AppUiWorkflowTests(unittest.TestCase):
         app.backup_detail.set.assert_called_once_with(
             "The temporary file was removed; any older backup was preserved."
         )
+
+    @patch("app_ui.xampp_service_running", side_effect=[False, True])
+    @patch("app_ui.xampp_root_from_mysql")
+    def test_xampp_switch_is_cancelled_when_previous_mysql_is_running(self, root_from_mysql, service_running):
+        root_from_mysql.side_effect = lambda path: "C:\\old-xampp" if "old" in path else "C:\\new-xampp"
+        app = ModernApp.__new__(ModernApp)
+        app.mysql_path = Mock()
+        app.mysql_path.get.return_value = r"C:\old-xampp\mysql\bin\mysql.exe"
+        app.accepted_mysql_path = app.mysql_path.get.return_value
+        app.xampp_switch_pending = False
+        app.import_active = False
+        app.importer = None
+        app.database_copy_active = False
+        app.maintenance_operation = None
+        app.sanitize_active = False
+        app.write_query_active = False
+        app.apache_service_status = Mock()
+        app.mysql_service_status = Mock()
+        app._confirm = Mock(return_value=False)
+        app._alert = Mock()
+        app.refresh_xampp_services = Mock()
+        app._thread = lambda worker: worker()
+        app._ui = lambda callback, *args: callback(*args)
+
+        app._request_mysql_path_switch(r"C:\new-xampp\mysql\bin\mysql.exe")
+
+        self.assertEqual(2, service_running.call_count)
+        self.assertIn("MySQL", app._confirm.call_args.args[1])
+        self.assertEqual(
+            r"C:\old-xampp\mysql\bin\mysql.exe",
+            app.mysql_path.set.call_args.args[0],
+        )
+        app.refresh_xampp_services.assert_called_once_with()
+
+    @patch("app_ui.xampp_service_running", side_effect=[True, True])
+    @patch("app_ui.xampp_root_from_mysql")
+    def test_confirmed_xampp_switch_clears_stale_database_selection(self, root_from_mysql, _service_running):
+        root_from_mysql.side_effect = lambda path: "C:\\old-xampp" if "old" in path else "C:\\new-xampp"
+        app = ModernApp.__new__(ModernApp)
+        app.mysql_path = Mock()
+        app.mysql_path.get.return_value = r"C:\old-xampp\mysql\bin\mysql.exe"
+        app.accepted_mysql_path = app.mysql_path.get.return_value
+        app.xampp_switch_pending = False
+        app.import_active = False
+        app.importer = None
+        app.database_copy_active = False
+        app.maintenance_operation = None
+        app.sanitize_active = False
+        app.write_query_active = False
+        app.apache_service_status = Mock()
+        app.mysql_service_status = Mock()
+        app.selected_db = Mock()
+        app.databases = ["old_database"]
+        app.database_status = Mock()
+        app._confirm = Mock(return_value=True)
+        app._alert = Mock()
+        app._filter_databases = Mock()
+        app._set_connection = Mock()
+        app.log = Mock()
+        app.refresh_xampp_services = Mock()
+        app._thread = lambda worker: worker()
+        app._ui = lambda callback, *args: callback(*args)
+
+        new_path = r"C:\new-xampp\mysql\bin\mysql.exe"
+        app._request_mysql_path_switch(new_path)
+
+        self.assertEqual(os.path.abspath(new_path), app.accepted_mysql_path)
+        self.assertEqual([], app.databases)
+        app.selected_db.set.assert_called_once_with("")
+        app._set_connection.assert_called_once_with(False, "Verify host and port")
+        app.refresh_xampp_services.assert_called_once_with()
+
+    def test_xampp_switch_is_blocked_during_database_work(self):
+        app = ModernApp.__new__(ModernApp)
+        app.mysql_path = Mock()
+        app.mysql_path.get.return_value = r"C:\old-xampp\mysql\bin\mysql.exe"
+        app.accepted_mysql_path = app.mysql_path.get.return_value
+        app.xampp_switch_pending = False
+        app.import_active = True
+        app.importer = None
+        app.database_copy_active = False
+        app.maintenance_operation = None
+        app.sanitize_active = False
+        app.write_query_active = False
+        app._alert = Mock()
+
+        app._request_mysql_path_switch(r"C:\new-xampp\mysql\bin\mysql.exe")
+
+        self.assertIn("active import", app._alert.call_args.args[1])
 
 
 if __name__ == "__main__":

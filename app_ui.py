@@ -316,6 +316,8 @@ class ModernApp:
         self._load_config()
         if not self.mysql_path.get():
             self.mysql_path.set(next((p for p in DEFAULT_MYSQL_PATHS if os.path.isfile(p)), ""))
+        self.accepted_mysql_path = self.mysql_path.get().strip()
+        self.xampp_switch_pending = False
         self._config_value = MySQLConfig("", "127.0.0.1", "3306", "root", "")
         self._sync_config()
         self.service = MySQLService(self._mysql_config)
@@ -867,7 +869,10 @@ class ModernApp:
         for column in (1, 3, 5, 7):
             grid.columnconfigure(column, weight=1)
         ttk.Label(grid, text="mysql.exe", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(grid, textvariable=self.mysql_path).grid(row=0, column=1, columnspan=6, sticky="ew", padx=(0, 8), pady=4)
+        self.mysql_path_entry = ttk.Entry(grid, textvariable=self.mysql_path)
+        self.mysql_path_entry.grid(row=0, column=1, columnspan=6, sticky="ew", padx=(0, 8), pady=4)
+        self.mysql_path_entry.bind("<FocusOut>", self._apply_manual_mysql_path)
+        self.mysql_path_entry.bind("<Return>", self._apply_manual_mysql_path)
         ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=0, column=7, sticky="e", pady=4)
         compact_fields = (("Host", self.host, ""), ("Port", self.port, ""),
                           ("User", self.user, ""), ("Password", self.password, "*"))
@@ -1151,7 +1156,9 @@ class ModernApp:
                 "the MySQL password. Quick links open the local index when Apache is running and phpMyAdmin when "
                 "both Apache and MySQL are running. If multiple XAMPP versions are installed, the service status "
                 "and Start/Stop actions apply to the installation containing the selected mysql.exe. Each running "
-                "installation must use its own Apache and MySQL ports.\n\n"
+                "installation must use its own Apache and MySQL ports. When mysql.exe is changed, the app checks the "
+                "previous installation and warns if its Apache or MySQL is still running. A switch clears the stale "
+                "database selection; verify the host and port before refreshing.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
                 "Copy selected duplicates the selected source into an existing empty destination database. "
                 "Delete selected permanently removes the selected database after you confirm the warning. "
@@ -1583,8 +1590,102 @@ class ModernApp:
     def browse_mysql(self):
         path = filedialog.askopenfilename(title="Select mysql.exe", filetypes=[("MySQL client", "mysql.exe"), ("All files", "*.*")])
         if path:
-            self.mysql_path.set(path)
+            self._request_mysql_path_switch(path)
+
+    def _apply_manual_mysql_path(self, _event=None):
+        candidate = self.mysql_path.get().strip()
+        accepted = getattr(self, "accepted_mysql_path", "")
+        if os.path.normcase(os.path.abspath(candidate or ".")) == os.path.normcase(os.path.abspath(accepted or ".")):
+            return
+        self.mysql_path.set(accepted)
+        self._request_mysql_path_switch(candidate)
+
+    def _request_mysql_path_switch(self, candidate):
+        """Validate a new XAMPP path and check the previous installation before switching."""
+        accepted = getattr(self, "accepted_mysql_path", self.mysql_path.get().strip())
+        self.mysql_path.set(accepted)
+        if getattr(self, "xampp_switch_pending", False):
+            self._alert("Switch already in progress", "Wait for the current XAMPP installation check to finish.")
+            return
+        if self._reject_conflicting_work("an XAMPP installation switch"):
+            return
+        try:
+            candidate_root = xampp_root_from_mysql(candidate)
+        except Exception as exc:
+            self._alert("Invalid XAMPP installation", str(exc), True)
+            return
+        candidate = os.path.abspath(os.path.expanduser(candidate.strip()))
+        try:
+            accepted_root = xampp_root_from_mysql(accepted) if accepted else None
+        except Exception:
+            accepted_root = None
+        if accepted_root and os.path.normcase(accepted_root) == os.path.normcase(candidate_root):
+            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None)
+            return
+        if not accepted_root:
+            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None)
+            return
+
+        self.xampp_switch_pending = True
+        self.apache_service_status.set("Checking previous installation…")
+        self.mysql_service_status.set("Checking previous installation…")
+
+        def worker():
+            running, error = [], None
+            try:
+                running = [
+                    XAMPP_SERVICES[service]["label"]
+                    for service in XAMPP_SERVICES
+                    if xampp_service_running(service, accepted_root)
+                ]
+            except Exception as exc:
+                error = str(exc)
+            self._ui(
+                self._finish_mysql_path_switch,
+                candidate,
+                accepted,
+                candidate_root,
+                running,
+                error,
+            )
+
+        self._thread(worker)
+
+    def _finish_mysql_path_switch(self, candidate, accepted, candidate_root, running, error):
+        self.xampp_switch_pending = False
+        warning = None
+        if error:
+            warning = (
+                "The previous XAMPP installation could not be checked. Switching without verification may connect "
+                f"to the wrong server.\n\nStatus error: {error}"
+            )
+        elif running:
+            services = " and ".join(running)
+            warning = (
+                f"The previous XAMPP installation still has {services} running:\n\n"
+                f"{os.path.dirname(os.path.dirname(os.path.dirname(accepted)))}\n\n"
+                "Stop it before switching unless both installations deliberately use different ports and separate "
+                "data directories. Otherwise the new service may fail to start or database work may reach the wrong server."
+            )
+        if warning and not self._confirm(
+            "Previous XAMPP is still active" if running else "Could not verify previous XAMPP",
+            warning,
+            True,
+            confirm_label="Switch anyway",
+        ):
+            self.mysql_path.set(accepted)
             self.refresh_xampp_services()
+            return
+
+        self.mysql_path.set(candidate)
+        self.accepted_mysql_path = candidate
+        self.selected_db.set("")
+        self.databases = []
+        self._filter_databases()
+        self._set_connection(False, "Verify host and port")
+        self.database_status.set("Refresh databases after verifying the connection")
+        self.log(f"Selected XAMPP installation: {candidate_root}")
+        self.refresh_xampp_services()
 
     def refresh_xampp_services(self, notify=False):
         try:
