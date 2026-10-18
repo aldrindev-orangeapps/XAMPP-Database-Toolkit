@@ -10,6 +10,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Safe reconnect attempts after MySQL connection failures
 - Resume after reopening the app when the file and target connection have not changed
 - Database creation, streaming copy, search, selection, and protected deletion
+- Complete streaming backups in `.sql` or `.sql.gz` and controlled restores into empty databases
 - Multi-XAMPP-aware Apache and MySQL controls with exact-installation status and clickable local URLs
 - Syntax-highlighted SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email, phone, and password column scanner/sanitizer
@@ -87,7 +88,7 @@ The first launch asks you to create one administrator password with at least fou
 
 - Five failed attempts trigger a persistent timed lockout.
 - **Logout** is always available in the header.
-- An inactive session automatically locks after 15 minutes. Idle locking is paused throughout an active import or database copy, and the 15-minute countdown restarts afterward.
+- An inactive session automatically locks after 15 minutes. Idle locking is paused throughout an active import, database copy, backup, or restore, and the 15-minute countdown restarts afterward.
 - Logging out clears the in-memory MySQL password and selected database.
 - The administrator password can be changed from **Databases → Change app password**.
 
@@ -95,12 +96,22 @@ This local login protects against casual access to the application. The Windows 
 
 ## Database tools
 
-- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while an import or database copy is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
+- **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while database work is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
 - **Copy selected** lets you choose another existing database as the destination, then duplicates the selected source through a bounded-memory `mysqldump.exe` to `mysql.exe` stream. The destination must be empty, so existing data is never overwritten. Create the empty destination with **New database** first.
 - **Delete selected** shows a permanent-deletion warning with a dedicated confirmation button. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
 - **Sanitizer** accepts multiple comma-separated column names for email, phone, and password (for example, `email, email_address, work_email`). Only exact full-name, case-insensitive matches are listed and updated, and every match in a category receives that category's single replacement value. Replacements are permanent, so retain the original dump.
 - Detected password columns can be reset across every row to `c4ca4238a0b923820dcc509a6f75849b`, whose default login value is `1`.
+
+## Backup and restore
+
+**Create backup** streams `mysqldump.exe` output in bounded chunks and includes schema, data, views, triggers, routines, and events. Choose plain `.sql` or compressed `.sql.gz`. Each file starts with toolkit metadata containing only the backup format version, source database, and UTC creation time; credentials are never written to the backup or command line.
+
+The app writes to a temporary file beside the selected destination and atomically replaces that destination only after `mysqldump.exe` succeeds. Cancelling or failing removes the temporary file and preserves any older backup at the same path.
+
+**Restore toolkit backup** accepts only marked `.sql` and `.sql.gz` files created by this toolkit. Select an existing destination database with no tables, views, routines, or events. Restore streams directly into `mysql.exe`; it does not create an import checkpoint and its byte progress must not be interpreted as statement-confirmed progress.
+
+Restore cancellation requires a danger confirmation. If a restore is cancelled or fails after starting, treat the destination as potentially partial: delete it, create a fresh empty database, and retry the restore. Database creation remains a separate **New database** action.
 
 ## Settings and security
 
@@ -115,6 +126,9 @@ Connection settings are saved in `~/.xampp_sql_importer.ini`; the password is ne
 | A statement exceeds `max_allowed_packet` | Follow the displayed `my.ini` instruction, restart MySQL, then resume. |
 | Import pauses after a disconnect | Review the shown statement. Retry may duplicate it; skip only if you know it committed. |
 | Database copy is rejected | Create or select an empty destination database; Copy never overwrites existing objects. |
+| Backup fails or is cancelled | The temporary output is removed and an older backup at the selected path remains unchanged. |
+| Restore is rejected | Select a toolkit-created `.sql` or `.sql.gz` backup and an existing completely empty database. |
+| Restore fails or is cancelled | Delete and recreate the potentially partial destination before retrying; restore is not resumable. |
 | Dump uses `DELIMITER` | Export ordinary schema/data SQL without stored routines, or use a specialized client. |
 | Font falls back to Segoe UI | Rebuild with the spec so `assets\fonts` is included. |
 

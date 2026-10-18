@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from datetime import datetime, timezone
+from typing import Callable, TypedDict
 
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -17,6 +21,9 @@ CONNECTION_MARKERS = (
     "connection refused", "connection timed out", "query timed out", "error 2002", "error 2003",
     "error 2006", "error 2013", "broken pipe",
 )
+BACKUP_HEADER_PREFIX = b"-- XAMPP_DATABASE_TOOLKIT_BACKUP "
+BACKUP_FORMAT_VERSION = 1
+STREAM_CHUNK_SIZE = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -38,10 +45,20 @@ class QueryResult:
     stderr: str = ""
 
 
+class BackupMetadata(TypedDict):
+    format_version: int
+    source_database: str
+    created_at: str
+
+
 class MySQLError(RuntimeError):
     def __init__(self, message: str, connection_error: bool = False):
         super().__init__(message)
         self.connection_error = connection_error
+
+
+class DatabaseOperationCancelled(RuntimeError):
+    """Raised after a streaming backup or restore is cancelled safely."""
 
 
 def is_connection_error(message: str) -> bool:
@@ -141,6 +158,279 @@ class MySQLService:
             return int(result.stdout.strip()) == 0
         except ValueError as exc:
             raise MySQLError("MySQL did not return a valid destination object count.") from exc
+
+    @staticmethod
+    def _drain_binary_error(stream, output: bytearray) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            if len(output) < 65_536:
+                output.extend(chunk[:65_536 - len(output)])
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    @classmethod
+    def _watch_cancellation(
+        cls,
+        process: subprocess.Popen,
+        cancelled: threading.Event,
+        finished: threading.Event,
+    ) -> None:
+        while not finished.wait(0.1):
+            if cancelled.is_set():
+                cls._stop_process(process)
+                return
+
+    @staticmethod
+    def _backup_header(database: str) -> bytes:
+        metadata = {
+            "format_version": BACKUP_FORMAT_VERSION,
+            "source_database": database,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return BACKUP_HEADER_PREFIX + json.dumps(
+            metadata, ensure_ascii=True, separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+
+    @staticmethod
+    def _read_backup_header(stream) -> BackupMetadata:
+        try:
+            line = stream.readline(65_537)
+        except (OSError, EOFError) as exc:
+            raise MySQLError("The backup file is damaged or is not a valid toolkit backup.") from exc
+        if len(line) > 65_536 or not line.startswith(BACKUP_HEADER_PREFIX):
+            raise MySQLError("Only backups created by XAMPP Database Toolkit can be restored here.")
+        try:
+            metadata = json.loads(line[len(BACKUP_HEADER_PREFIX):].decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MySQLError("The toolkit backup metadata is damaged.") from exc
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("format_version") != BACKUP_FORMAT_VERSION
+            or not isinstance(metadata.get("source_database"), str)
+            or not isinstance(metadata.get("created_at"), str)
+        ):
+            raise MySQLError("This toolkit backup format is unsupported or incomplete.")
+        return BackupMetadata(
+            format_version=metadata["format_version"],
+            source_database=metadata["source_database"],
+            created_at=metadata["created_at"],
+        )
+
+    def inspect_backup(self, path: str) -> BackupMetadata:
+        """Validate a toolkit backup header and return its non-secret metadata."""
+        lowered_path = path.casefold()
+        if not (lowered_path.endswith(".sql") or lowered_path.endswith(".sql.gz")):
+            raise MySQLError("Toolkit backups must use the .sql or .sql.gz file extension.")
+        compressed = lowered_path.endswith(".sql.gz")
+        try:
+            with open(path, "rb") as raw:
+                if compressed:
+                    with gzip.GzipFile(fileobj=raw, mode="rb") as stream:
+                        return self._read_backup_header(stream)
+                return self._read_backup_header(raw)
+        except FileNotFoundError:
+            raise
+        except (OSError, EOFError) as exc:
+            raise MySQLError("The backup file is damaged or cannot be read.") from exc
+
+    def backup_database(
+        self,
+        database: str,
+        output_path: str,
+        compress: bool,
+        progress: Callable[[int], None] | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> int:
+        """Stream a complete logical backup to an atomically replaced file."""
+        cfg = self.config()
+        dump_executable = os.path.join(os.path.dirname(cfg.executable), "mysqldump.exe")
+        if not os.path.isfile(dump_executable):
+            raise FileNotFoundError(
+                "mysqldump.exe was not found beside mysql.exe in the selected XAMPP folder."
+            )
+        output_path = os.path.abspath(output_path)
+        output_directory = os.path.dirname(output_path)
+        if not os.path.isdir(output_directory):
+            raise FileNotFoundError(f"Backup folder was not found: {output_directory}")
+        dump_command = [
+            dump_executable,
+            "--host", cfg.host or "127.0.0.1",
+            "--port", cfg.port or "3306",
+            "--user", cfg.user or "root",
+            "--default-character-set=utf8mb4",
+            "--single-transaction",
+            "--quick",
+            "--routines",
+            "--events",
+            "--triggers",
+            "--hex-blob",
+            "--",
+            database,
+        ]
+        environment = os.environ.copy()
+        if cfg.password:
+            environment["MYSQL_PWD"] = cfg.password
+        else:
+            environment.pop("MYSQL_PWD", None)
+
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=".xampp-toolkit-backup-", suffix=".tmp", dir=output_directory,
+        )
+        os.close(temp_fd)
+        process = None
+        error_output = bytearray()
+        cancellation = cancelled or threading.Event()
+        finished = threading.Event()
+        try:
+            process = subprocess.Popen(
+                dump_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            assert process.stdout is not None
+            error_thread = threading.Thread(
+                target=self._drain_binary_error,
+                args=(process.stderr, error_output),
+                daemon=True,
+            )
+            error_thread.start()
+            threading.Thread(
+                target=self._watch_cancellation,
+                args=(process, cancellation, finished),
+                daemon=True,
+            ).start()
+            with open(temp_path, "wb") as raw:
+                destination = gzip.GzipFile(filename="", fileobj=raw, mode="wb") if compress else raw
+                try:
+                    destination.write(self._backup_header(database))
+                    while True:
+                        if cancellation.is_set():
+                            raise DatabaseOperationCancelled("Backup cancelled.")
+                        chunk = process.stdout.read(STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        if progress:
+                            progress(raw.tell())
+                finally:
+                    if compress:
+                        destination.close()
+                raw.flush()
+                os.fsync(raw.fileno())
+            return_code = process.wait()
+            error_thread.join()
+            if cancellation.is_set():
+                raise DatabaseOperationCancelled("Backup cancelled.")
+            if return_code:
+                detail = error_output.decode("utf-8", "replace").strip()
+                raise MySQLError(detail or f"mysqldump.exe exited with code {return_code}.")
+            os.replace(temp_path, output_path)
+            if progress:
+                progress(os.path.getsize(output_path))
+            return os.path.getsize(output_path)
+        finally:
+            finished.set()
+            if process is not None:
+                self._stop_process(process)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+    def restore_database(
+        self,
+        backup_path: str,
+        destination: str,
+        progress: Callable[[int, int], None] | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> BackupMetadata:
+        """Stream a validated toolkit backup into an existing empty database."""
+        metadata = self.inspect_backup(backup_path)
+        if not self.database_is_empty(destination):
+            raise MySQLError("The destination database is not empty. Choose an empty database.")
+        total = os.path.getsize(backup_path)
+        compressed = backup_path.casefold().endswith(".gz")
+        command, environment = self.command(destination)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=environment,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        assert process.stdin is not None
+        error_output = bytearray()
+        error_thread = threading.Thread(
+            target=self._drain_binary_error,
+            args=(process.stderr, error_output),
+            daemon=True,
+        )
+        error_thread.start()
+        cancellation = cancelled or threading.Event()
+        finished = threading.Event()
+        threading.Thread(
+            target=self._watch_cancellation,
+            args=(process, cancellation, finished),
+            daemon=True,
+        ).start()
+        try:
+            with open(backup_path, "rb") as raw:
+                stream = gzip.GzipFile(fileobj=raw, mode="rb") if compressed else raw
+                try:
+                    self._read_backup_header(stream)
+                    while True:
+                        if cancellation.is_set():
+                            raise DatabaseOperationCancelled("Restore cancelled.")
+                        chunk = stream.read(STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        process.stdin.write(chunk)
+                        if progress:
+                            progress(min(raw.tell(), total), total)
+                finally:
+                    if compressed:
+                        stream.close()
+            process.stdin.close()
+            return_code = process.wait()
+            error_thread.join()
+            if cancellation.is_set():
+                raise DatabaseOperationCancelled("Restore cancelled.")
+            if return_code:
+                detail = error_output.decode("utf-8", "replace").strip()
+                raise MySQLError(detail or f"mysql.exe exited with code {return_code}.")
+            if progress:
+                progress(total, total)
+            return metadata
+        except (BrokenPipeError, OSError) as exc:
+            if cancellation.is_set():
+                raise DatabaseOperationCancelled("Restore cancelled.") from exc
+            self._stop_process(process)
+            error_thread.join()
+            detail = error_output.decode("utf-8", "replace").strip()
+            raise MySQLError(detail or "mysql.exe stopped before the backup was restored.") from exc
+        finally:
+            finished.set()
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            self._stop_process(process)
 
     def copy_database(self, source: str, destination: str) -> None:
         """Stream one database through mysqldump into another database."""

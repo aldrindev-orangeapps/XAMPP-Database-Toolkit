@@ -1,11 +1,14 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from app_ui import IDLE_LOGOUT_SECONDS, ModernApp
+from app_ui import IDLE_LOGOUT_SECONDS, NAVIGATION_PAGES, ModernApp
 from mysql_service import MySQLConfig
 
 
 class AppUiWorkflowTests(unittest.TestCase):
+    def test_backup_restore_navigation_follows_import(self):
+        self.assertEqual(("Databases", "Import", "Backup & Restore"), NAVIGATION_PAGES[:3])
+
     def test_database_deletion_uses_confirmation_button_and_quotes_name(self):
         app = ModernApp.__new__(ModernApp)
         app.importer = None
@@ -159,6 +162,80 @@ class AppUiWorkflowTests(unittest.TestCase):
         app._check_idle_logout()
 
         app.logout.assert_called_once_with(automatic=True)
+
+    @patch("app_ui.time.monotonic", return_value=IDLE_LOGOUT_SECONDS + 10)
+    def test_idle_logout_is_suspended_during_backup_or_restore(self, _monotonic):
+        for operation in ("backup", "restore"):
+            app = ModernApp.__new__(ModernApp)
+            app.authenticated = True
+            app.import_active = False
+            app.database_copy_active = False
+            app.importer = None
+            app.maintenance_operation = operation
+            app.last_activity = 0
+            app.logout = Mock()
+            app.root = Mock()
+
+            app._check_idle_logout()
+
+            app.logout.assert_not_called()
+            self.assertEqual(IDLE_LOGOUT_SECONDS + 10, app.last_activity)
+
+    def test_active_backup_blocks_conflicting_database_work(self):
+        app = ModernApp.__new__(ModernApp)
+        app.import_active = False
+        app.importer = None
+        app.database_copy_active = False
+        app.maintenance_operation = "backup"
+        app.sanitize_active = False
+        app.write_query_active = False
+        app._alert = Mock()
+
+        self.assertTrue(app._reject_conflicting_work("a restore"))
+        app._alert.assert_called_once_with(
+            "Database work in progress",
+            "Wait for the active backup before starting a restore.",
+            True,
+        )
+
+    def test_restore_cancellation_warns_destination_is_partial(self):
+        app = ModernApp.__new__(ModernApp)
+        app.maintenance_started = 0
+        app.maintenance_operation = "restore"
+        app.maintenance_cancel = Mock()
+        app.last_activity = 0
+        app._set_maintenance_controls = Mock()
+        app.restore_status = Mock()
+        app.restore_detail = Mock()
+        app.log = Mock()
+        app._alert = Mock()
+        app.refresh_databases = Mock()
+
+        app._restore_finished("backup.sql", "target_db", None, True, None)
+
+        self.assertIn("partial", app.restore_detail.set.call_args.args[0])
+        self.assertIn("Delete and recreate", app._alert.call_args.args[1])
+        app.refresh_databases.assert_called_once_with()
+
+    def test_backup_progress_is_empty_after_cancellation(self):
+        app = ModernApp.__new__(ModernApp)
+        app.maintenance_started = 0
+        app.maintenance_operation = "backup"
+        app.maintenance_cancel = Mock()
+        app.last_activity = 0
+        app.backup_progress = Mock()
+        app._set_maintenance_controls = Mock()
+        app.backup_status = Mock()
+        app.backup_detail = Mock()
+        app.log = Mock()
+
+        app._backup_finished("source_db", "backup.sql", 0, True, None)
+
+        app.backup_progress.stop.assert_called_once_with()
+        app.backup_progress.configure.assert_called_once_with(mode="determinate", value=0)
+        app.backup_detail.set.assert_called_once_with(
+            "The temporary file was removed; any older backup was preserved."
+        )
 
 
 if __name__ == "__main__":

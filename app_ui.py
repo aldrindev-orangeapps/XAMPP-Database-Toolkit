@@ -18,7 +18,12 @@ from tkinter import filedialog, simpledialog, ttk
 from checkpoints import CheckpointStore, checkpoint_key
 from importer import ResumableImporter
 from local_auth import AuthError, LocalAuth
-from mysql_service import MySQLConfig, MySQLService, SYSTEM_DATABASES
+from mysql_service import (
+    DatabaseOperationCancelled,
+    MySQLConfig,
+    MySQLService,
+    SYSTEM_DATABASES,
+)
 from sql_parser import is_read_only_sql, split_sql_text
 
 
@@ -40,7 +45,9 @@ XAMPP_SERVICES = {
     "apache": {"process": "httpd.exe", "label": "Apache"},
     "mysql": {"process": "mysqld.exe", "label": "MySQL"},
 }
-NAVIGATION_PAGES = ("Databases", "Import", "Sanitizer", "SQL Console", "Logs", "User Manual")
+NAVIGATION_PAGES = (
+    "Databases", "Import", "Backup & Restore", "Sanitizer", "SQL Console", "Logs", "User Manual",
+)
 PRIVATE_FONT_FLAG = 0x10
 _registered_font_paths: list[str] = []
 
@@ -272,6 +279,14 @@ class ModernApp:
         self.phpmyadmin_url = tk.StringVar(value="http://localhost/phpmyadmin/")
         self.xampp_service_states = {"apache": False, "mysql": False}
         self.import_status, self.import_detail = tk.StringVar(value="Ready to import"), tk.StringVar(value="Select a SQL dump to begin.")
+        self.backup_database = tk.StringVar()
+        self.backup_format = tk.StringVar(value="gzip")
+        self.backup_status = tk.StringVar(value="Ready to create a backup")
+        self.backup_detail = tk.StringVar(value="Choose a source database and output format.")
+        self.restore_file = tk.StringVar()
+        self.restore_database = tk.StringVar()
+        self.restore_status = tk.StringVar(value="Ready to restore")
+        self.restore_detail = tk.StringVar(value="Choose a toolkit backup and an empty destination database.")
         self.email_replacement, self.phone_replacement = tk.StringVar(value="test@example.com"), tk.StringVar(value="09170000000")
         self.password_replacement = tk.StringVar(value=DEFAULT_PASSWORD_HASH)
         self.email_column_name = tk.StringVar(value=DEFAULT_EMAIL_COLUMN)
@@ -283,6 +298,11 @@ class ModernApp:
         self.importer = None
         self.import_active = False
         self.database_copy_active = False
+        self.maintenance_operation = None
+        self.maintenance_cancel = threading.Event()
+        self.maintenance_started = 0.0
+        self.sanitize_active = False
+        self.write_query_active = False
         self.import_cancel = threading.Event()
         self.import_started = 0.0
         self.after_import_action = None
@@ -475,6 +495,15 @@ class ModernApp:
     def logout(self, automatic=False):
         if not self.authenticated:
             return
+        if self.maintenance_operation:
+            if automatic:
+                self.last_activity = time.monotonic()
+            else:
+                self._alert(
+                    "Database work in progress",
+                    f"Cancel or wait for the active {self.maintenance_operation} before logging out.",
+                )
+            return
         if self.database_copy_active:
             if automatic:
                 self.last_activity = time.monotonic()
@@ -496,6 +525,16 @@ class ModernApp:
             self.cancel_button.configure(state="disabled")
             self.importer.cancel()
             return
+        active = self._active_database_work()
+        if active:
+            if automatic:
+                self.last_activity = time.monotonic()
+            else:
+                self._alert(
+                    "Database work in progress",
+                    f"Wait for the active {active} before logging out.",
+                )
+            return
         self._finish_logout(automatic)
 
     def _finish_logout(self, automatic=False):
@@ -516,10 +555,34 @@ class ModernApp:
         """Include the short setup/cleanup windows around an import worker."""
         return self.import_active or self.importer is not None
 
+    def _active_database_work(self) -> str | None:
+        if self._import_is_active():
+            return "import"
+        if getattr(self, "database_copy_active", False):
+            return "database copy"
+        if getattr(self, "maintenance_operation", None):
+            return self.maintenance_operation
+        if getattr(self, "sanitize_active", False):
+            return "sanitizer update"
+        if getattr(self, "write_query_active", False):
+            return "write query"
+        return None
+
+    def _reject_conflicting_work(self, requested: str) -> bool:
+        active = self._active_database_work()
+        if not active:
+            return False
+        self._alert(
+            "Database work in progress",
+            f"Wait for the active {active} before starting {requested}.",
+            True,
+        )
+        return True
+
     def _check_idle_logout(self):
         if self.authenticated:
             now = time.monotonic()
-            if self._import_is_active() or self.database_copy_active:
+            if self._active_database_work():
                 self.last_activity = now
             elif now - self.last_activity >= IDLE_LOGOUT_SECONDS:
                 self.logout(automatic=True)
@@ -579,6 +642,7 @@ class ModernApp:
         ).pack(side="right", padx=28, pady=9)
         self.pages = {}
         self._build_import_page()
+        self._build_backup_restore_page()
         self._build_databases_page()
         self._build_query_page()
         self._build_sanitize_page()
@@ -680,6 +744,114 @@ class ModernApp:
             style="Card.TLabel",
             wraplength=850,
         ).pack(anchor="w", pady=(4, 0))
+
+    def _build_backup_restore_page(self):
+        page = self._new_page("Backup & Restore")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True, padx=28, pady=18)
+        ttk.Label(body, text="Backup & restore", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Create complete toolkit backups and restore them into an empty database.",
+            foreground=MUTED,
+        ).pack(anchor="w", pady=(2, 12))
+
+        backup = self._card(
+            body,
+            "Create backup",
+            "Includes schema, data, views, triggers, routines, and events.",
+            padding=16,
+            subtitle_gap=8,
+        )
+        backup.pack(fill="x")
+        backup_fields = ttk.Frame(backup, style="Card.TFrame")
+        backup_fields.pack(fill="x")
+        backup_fields.columnconfigure(1, weight=1)
+        ttk.Label(backup_fields, text="Source database", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=4,
+        )
+        self.backup_database_box = ttk.Combobox(
+            backup_fields, textvariable=self.backup_database, state="readonly",
+        )
+        self.backup_database_box.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(backup_fields, text="Format", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=4,
+        )
+        formats = ttk.Frame(backup_fields, style="Card.TFrame")
+        formats.grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Radiobutton(formats, text="Compressed SQL (.sql.gz)", variable=self.backup_format,
+                        value="gzip").pack(side="left")
+        ttk.Radiobutton(formats, text="SQL (.sql)", variable=self.backup_format,
+                        value="sql").pack(side="left", padx=(16, 0))
+        backup_actions = ttk.Frame(backup, style="Card.TFrame")
+        backup_actions.pack(fill="x", pady=(10, 0))
+        ttk.Label(backup_actions, textvariable=self.backup_status, style="Muted.TLabel").pack(side="left")
+        self.backup_button = ttk.Button(
+            backup_actions, text="Create backup", style="Primary.TButton", command=self.start_backup,
+        )
+        self.backup_button.pack(side="right")
+        self.cancel_backup_button = ttk.Button(
+            backup_actions, text="Cancel", command=self.cancel_backup, state="disabled",
+        )
+        self.cancel_backup_button.pack(side="right", padx=8)
+        self.backup_progress = ttk.Progressbar(backup, mode="determinate", maximum=100, value=0)
+        self.backup_progress.pack(fill="x", pady=(8, 3))
+        ttk.Label(
+            backup, textvariable=self.backup_detail, style="Muted.TLabel",
+            wraplength=800, justify="left",
+        ).pack(anchor="w")
+
+        restore = self._card(
+            body,
+            "Restore toolkit backup",
+            "Restore a .sql or .sql.gz backup into an existing empty database.",
+            padding=16,
+            subtitle_gap=8,
+        )
+        restore.pack(fill="x", pady=(12, 0))
+        restore_fields = ttk.Frame(restore, style="Card.TFrame")
+        restore_fields.pack(fill="x")
+        restore_fields.columnconfigure(1, weight=1)
+        ttk.Label(restore_fields, text="Backup file", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=4,
+        )
+        ttk.Entry(restore_fields, textvariable=self.restore_file).grid(
+            row=0, column=1, sticky="ew", pady=4,
+        )
+        ttk.Button(restore_fields, text="Browse file", command=self.browse_restore_file).grid(
+            row=0, column=2, padx=(10, 0), pady=4,
+        )
+        ttk.Label(restore_fields, text="Empty destination", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=4,
+        )
+        self.restore_database_box = ttk.Combobox(
+            restore_fields, textvariable=self.restore_database, state="readonly",
+        )
+        self.restore_database_box.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+        restore_actions = ttk.Frame(restore, style="Card.TFrame")
+        restore_actions.pack(fill="x", pady=(10, 0))
+        ttk.Label(restore_actions, textvariable=self.restore_status, style="Muted.TLabel").pack(side="left")
+        self.restore_button = ttk.Button(
+            restore_actions, text="Start restore", style="Danger.TButton", command=self.start_restore,
+        )
+        self.restore_button.pack(side="right")
+        self.cancel_restore_button = ttk.Button(
+            restore_actions, text="Cancel", command=self.cancel_restore, state="disabled",
+        )
+        self.cancel_restore_button.pack(side="right", padx=8)
+        self.restore_progress = ttk.Progressbar(restore, mode="determinate", maximum=100)
+        self.restore_progress.pack(fill="x", pady=(8, 3))
+        ttk.Label(
+            restore, textvariable=self.restore_detail, style="Muted.TLabel",
+            wraplength=800, justify="left",
+        ).pack(anchor="w")
+        ttk.Label(
+            restore,
+            text=("Restore progress measures bytes read and sent, not statements committed. "
+                  "A cancelled or failed restore cannot be resumed."),
+            style="Card.TLabel",
+            wraplength=800,
+        ).pack(anchor="w", pady=(8, 0))
 
     def _build_databases_page(self):
         page = self._new_page("Databases")
@@ -970,7 +1142,7 @@ class ModernApp:
                 "2. Start MySQL if its status is Stopped. Start Apache if your local website needs it.\n"
                 "3. Enter the host, port, MySQL user, and password, then click Test connection.\n"
                 "4. Select an existing database or create a new one.\n"
-                "5. Continue to Import, Sanitizer, or SQL Console.",
+                "5. Continue to Import, Backup & Restore, Sanitizer, or SQL Console.",
             ),
             (
                 "Databases and XAMPP services",
@@ -983,7 +1155,7 @@ class ModernApp:
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
                 "Copy selected duplicates the selected source into an existing empty destination database. "
                 "Delete selected permanently removes the selected database after you confirm the warning. "
-                "MySQL cannot be stopped while an import or database copy is active.",
+                "MySQL cannot be stopped while database work is active.",
             ),
             (
                 "Import SQL dumps",
@@ -992,6 +1164,17 @@ class ModernApp:
                 "If an import is cancelled or interrupted, its confirmed checkpoint is preserved. When the same "
                 "file and database are used again, choose Resume to continue, Start fresh to restart, or Cancel. "
                 "Keep the app open while a large current statement finishes during a safe cancellation.",
+            ),
+            (
+                "Backup and restore",
+                "Create backup streams a complete database through mysqldump into .sql or compressed .sql.gz. "
+                "Toolkit metadata records the format version, source database, and UTC creation time; it never "
+                "contains credentials. The selected destination is replaced atomically only after success, so a "
+                "failed or cancelled backup preserves any older file.\n\n"
+                "Restore accepts toolkit-created backups only and streams directly into an existing database that "
+                "has no tables, views, routines, or events. Restore progress is bytes transmitted, not confirmed "
+                "statements, and cannot be resumed. If restore fails or is cancelled, delete and recreate the "
+                "potentially partial destination before trying again.",
             ),
             (
                 "Sanitize development data",
@@ -1010,10 +1193,10 @@ class ModernApp:
             ),
             (
                 "Logs, login, and safety",
-                "Logs records connection, import, SQL, sanitizer, and service activity for the current session. "
+                "Logs records connection, import, backup, restore, SQL, sanitizer, and service activity for the current session. "
                 "Use Change app password under Databases to update the administrator password; the minimum is four "
                 "characters. Five failed attempts trigger a timed lockout, and an inactive session locks after 15 minutes. "
-                "Idle locking is paused throughout an active import or database copy and restarts afterward.\n\n"
+                "Idle locking is paused throughout an active import, database copy, backup, or restore and restarts afterward.\n\n"
                 "Always keep a backup before deleting databases or sanitizing data. Do not close XAMPP or stop MySQL "
                 "during an active import.",
             ),
@@ -1023,6 +1206,8 @@ class ModernApp:
                 "Connection failed: Start MySQL and verify the host, port, user, and password.\n"
                 "Apache will not start: Another application may already be using port 80 or 443; check Apache logs.\n"
                 "Import cannot use DELIMITER: Export ordinary schema/data SQL without stored routines or triggers.\n"
+                "Restore is rejected: Use a toolkit-created backup and an existing completely empty destination.\n"
+                "Restore was interrupted: Delete and recreate the destination before retrying.\n"
                 "More details: Review the Logs page for the exact error message.",
             ),
         )
@@ -1164,6 +1349,236 @@ class ModernApp:
             self.sql_file.set(path)
             self.import_detail.set(f"{os.path.basename(path)} • {self._format_bytes(os.path.getsize(path))}")
 
+    def browse_restore_file(self):
+        path = filedialog.askopenfilename(
+            title="Select toolkit backup",
+            filetypes=[
+                ("Toolkit backups", "*.sql.gz *.sql"),
+                ("Compressed SQL", "*.sql.gz"),
+                ("SQL files", "*.sql"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self.restore_file.set(path)
+        try:
+            metadata = self.service.inspect_backup(path)
+            self.restore_detail.set(
+                f"{os.path.basename(path)} • {self._format_bytes(os.path.getsize(path))} • "
+                f"source {metadata['source_database']}"
+            )
+            self.restore_status.set("Toolkit backup validated")
+        except Exception as exc:
+            self.restore_status.set("Invalid backup")
+            self.restore_detail.set(str(exc))
+
+    @staticmethod
+    def _backup_filename(database):
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", database).strip(" .") or "database"
+        return f"{safe_name}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+    def _set_maintenance_controls(self, operation=None):
+        active = operation is not None
+        self.backup_button.configure(state="disabled" if active else "normal")
+        self.cancel_backup_button.configure(state="normal" if operation == "backup" else "disabled")
+        self.restore_button.configure(state="disabled" if active else "normal")
+        self.cancel_restore_button.configure(state="normal" if operation == "restore" else "disabled")
+        self.backup_database_box.configure(state="disabled" if active else "readonly")
+        self.restore_database_box.configure(state="disabled" if active else "readonly")
+
+    def start_backup(self):
+        if self._reject_conflicting_work("a backup"):
+            return
+        database = self.backup_database.get().strip()
+        if not database:
+            self._alert("No source database", "Select a database to back up first.")
+            return
+        compressed = self.backup_format.get() == "gzip"
+        extension = ".sql.gz" if compressed else ".sql"
+        output_path = filedialog.asksaveasfilename(
+            title="Save database backup",
+            defaultextension=extension,
+            initialfile=self._backup_filename(database) + extension,
+            filetypes=[("Compressed SQL", "*.sql.gz")] if compressed else [("SQL files", "*.sql")],
+        )
+        if not output_path:
+            return
+        if compressed and not output_path.casefold().endswith(".sql.gz"):
+            output_path += ".gz" if output_path.casefold().endswith(".sql") else ".sql.gz"
+        elif not compressed and not output_path.casefold().endswith(".sql"):
+            output_path += ".sql"
+        self._sync_config()
+        self.maintenance_cancel.clear()
+        self.maintenance_operation = "backup"
+        self.maintenance_started = time.monotonic()
+        self.backup_status.set(f"Backing up {database}…")
+        self.backup_detail.set("Starting mysqldump…")
+        self.backup_progress.configure(mode="indeterminate", value=0)
+        self.backup_progress.start(12)
+        self._set_maintenance_controls("backup")
+        last_update = [0.0]
+
+        def progress(written):
+            now = time.monotonic()
+            if now - last_update[0] < 0.1:
+                return
+            last_update[0] = now
+            self._ui(
+                self.backup_detail.set,
+                f"Written {self._format_bytes(written)} • elapsed "
+                f"{self._format_duration(now - self.maintenance_started)}",
+            )
+
+        def worker():
+            size, error, was_cancelled = 0, None, False
+            try:
+                size = self.service.backup_database(
+                    database, output_path, compressed, progress, self.maintenance_cancel,
+                )
+            except DatabaseOperationCancelled:
+                was_cancelled = True
+            except Exception as exc:
+                error = str(exc)
+            self._ui(self._backup_finished, database, output_path, size, was_cancelled, error)
+
+        self._thread(worker)
+
+    def cancel_backup(self):
+        if self.maintenance_operation == "backup":
+            self.backup_status.set("Cancelling backup…")
+            self.cancel_backup_button.configure(state="disabled")
+            self.maintenance_cancel.set()
+
+    def _backup_finished(self, database, output_path, size, was_cancelled, error):
+        elapsed = time.monotonic() - self.maintenance_started
+        self.maintenance_operation = None
+        self.maintenance_cancel.clear()
+        self.last_activity = time.monotonic()
+        self.backup_progress.stop()
+        self.backup_progress.configure(mode="determinate", value=0)
+        self._set_maintenance_controls()
+        if was_cancelled:
+            self.backup_status.set("Backup cancelled")
+            self.backup_detail.set("The temporary file was removed; any older backup was preserved.")
+            self.log(f"Backup of {database} was cancelled.")
+        elif error:
+            self.backup_status.set("Backup failed")
+            self.backup_detail.set("No incomplete backup was left at the selected destination.")
+            self.log(f"Backup failed: {error}")
+            self._alert("Backup failed", error, True)
+        else:
+            self.backup_progress["value"] = 100
+            self.backup_status.set("Backup complete")
+            self.backup_detail.set(
+                f"{self._format_bytes(size)} written in {self._format_duration(elapsed)} • {output_path}"
+            )
+            self.log(f"Backed up {database} to {output_path}.")
+            self._alert("Backup complete", f"The complete database backup was saved to:\n\n{output_path}")
+
+    def start_restore(self):
+        if self._reject_conflicting_work("a restore"):
+            return
+        backup_path = self.restore_file.get().strip()
+        destination = self.restore_database.get().strip()
+        if not backup_path or not os.path.isfile(backup_path) or not destination:
+            self._alert("Missing information", "Select a valid toolkit backup and an existing destination database.")
+            return
+        try:
+            metadata = self.service.inspect_backup(backup_path)
+        except Exception as exc:
+            self._alert("Invalid backup", str(exc), True)
+            return
+        if not self._confirm(
+            "Restore database",
+            (f"Restore the backup of {metadata['source_database']} into {destination}?\n\n"
+             "The destination must be completely empty. Restore is not resumable; if it fails or is "
+             "cancelled, delete and recreate the destination before retrying."),
+            True,
+            confirm_label="Restore backup",
+        ):
+            return
+        self._sync_config()
+        self.maintenance_cancel.clear()
+        self.maintenance_operation = "restore"
+        self.maintenance_started = time.monotonic()
+        self.restore_status.set(f"Restoring into {destination}…")
+        self.restore_detail.set("Validating the empty destination…")
+        self.restore_progress["value"] = 0
+        self._set_maintenance_controls("restore")
+        last_update = [0.0]
+
+        def progress(done, total):
+            now = time.monotonic()
+            if done < total and now - last_update[0] < 0.1:
+                return
+            last_update[0] = now
+            percent = min(100, done / max(1, total) * 100)
+
+            def update():
+                self.restore_progress["value"] = percent
+                self.restore_detail.set(
+                    f"Read {self._format_bytes(done)} of {self._format_bytes(total)} • transmitted, not confirmed "
+                    f"• elapsed {self._format_duration(now - self.maintenance_started)}"
+                )
+            self._ui(update)
+
+        def worker():
+            result, error, was_cancelled = None, None, False
+            try:
+                result = self.service.restore_database(
+                    backup_path, destination, progress, self.maintenance_cancel,
+                )
+            except DatabaseOperationCancelled:
+                was_cancelled = True
+            except Exception as exc:
+                error = str(exc)
+            self._ui(self._restore_finished, backup_path, destination, result, was_cancelled, error)
+
+        self._thread(worker)
+
+    def cancel_restore(self):
+        if self.maintenance_operation != "restore":
+            return
+        if not self._confirm(
+            "Cancel restore",
+            "Stop the restore now? The destination will be potentially partial and must be deleted and recreated before retrying.",
+            True,
+            confirm_label="Stop restore",
+        ):
+            return
+        self.restore_status.set("Cancelling restore…")
+        self.cancel_restore_button.configure(state="disabled")
+        self.maintenance_cancel.set()
+
+    def _restore_finished(self, backup_path, destination, metadata, was_cancelled, error):
+        elapsed = time.monotonic() - self.maintenance_started
+        self.maintenance_operation = None
+        self.maintenance_cancel.clear()
+        self.last_activity = time.monotonic()
+        self._set_maintenance_controls()
+        if was_cancelled or error:
+            self.restore_status.set("Restore cancelled" if was_cancelled else "Restore failed")
+            self.restore_detail.set(
+                f"{destination} may be partial. Delete and recreate it before another restore."
+            )
+            detail = "The restore was cancelled." if was_cancelled else error
+            self.log(f"Restore into {destination} did not complete: {detail}")
+            self._alert(
+                "Restore cancelled" if was_cancelled else "Restore failed",
+                f"{detail}\n\n{destination} may contain partial objects or data. Delete and recreate it before retrying.",
+                True,
+            )
+        else:
+            self.restore_progress["value"] = 100
+            self.restore_status.set("Restore complete")
+            self.restore_detail.set(
+                f"Restored backup of {metadata['source_database']} in {self._format_duration(elapsed)}."
+            )
+            self.log(f"Restored {backup_path} into {destination}.")
+            self._alert("Restore complete", f"The backup was restored successfully into {destination}.")
+        self.refresh_databases()
+
     def browse_mysql(self):
         path = filedialog.askopenfilename(title="Select mysql.exe", filetypes=[("MySQL client", "mysql.exe"), ("All files", "*.*")])
         if path:
@@ -1254,8 +1669,8 @@ class ModernApp:
 
     def control_xampp_service(self, service, action):
         label = XAMPP_SERVICES[service]["label"]
-        if action == "stop" and service == "mysql" and (self._import_is_active() or self.database_copy_active):
-            operation = "import" if self._import_is_active() else "database copy"
+        operation = self._active_database_work()
+        if action == "stop" and service == "mysql" and operation:
             self._alert("Database work in progress", f"Wait for the active {operation} before stopping MySQL.", True)
             return
         if action == "stop" and not self._confirm(
@@ -1394,6 +1809,18 @@ class ModernApp:
             self.db_list.insert("end", name)
             if name == self.selected_db.get():
                 self.db_list.selection_set("end")
+        for box_name, variable_name in (
+            ("backup_database_box", "backup_database"),
+            ("restore_database_box", "restore_database"),
+        ):
+            if not hasattr(self, box_name):
+                continue
+            box = getattr(self, box_name)
+            variable = getattr(self, variable_name)
+            box.configure(values=self.databases)
+            if variable.get() not in self.databases:
+                preferred = self.selected_db.get()
+                variable.set(preferred if preferred in self.databases else (self.databases[0] if self.databases else ""))
 
     def _select_database(self, _event=None):
         selection = self.db_list.curselection()
@@ -1401,6 +1828,8 @@ class ModernApp:
             self.selected_db.set(self.db_list.get(selection[0]))
 
     def create_database(self):
+        if self._reject_conflicting_work("database creation"):
+            return
         name = simpledialog.askstring("New database", "Database name:", parent=self.root)
         if not name:
             return
@@ -1419,8 +1848,7 @@ class ModernApp:
         self._thread(worker)
 
     def delete_database(self):
-        if self._import_is_active():
-            self._alert("Import in progress", "Stop the active import before deleting a database.", True)
+        if self._reject_conflicting_work("database deletion"):
             return
         name = self.selected_db.get()
         if not name:
@@ -1459,10 +1887,7 @@ class ModernApp:
         self._thread(worker)
 
     def copy_database(self):
-        if self.database_copy_active:
-            return
-        if self._import_is_active():
-            self._alert("Import in progress", "Stop the active import before copying a database.", True)
+        if self._reject_conflicting_work("a database copy"):
             return
         source = self.selected_db.get()
         if not source:
@@ -1604,8 +2029,7 @@ class ModernApp:
         self.refresh_databases()
 
     def start_import(self):
-        if self.database_copy_active:
-            self._alert("Copy in progress", "Wait for the database copy to finish before starting an import.")
+        if self._reject_conflicting_work("an import"):
             return
         path, database = self.sql_file.get(), self.selected_db.get()
         if not database or not path or not os.path.isfile(path):
@@ -1764,11 +2188,14 @@ class ModernApp:
             self._alert("Invalid SQL", str(exc), True)
             return
         destructive = [sql for sql in statements if not is_read_only_sql(sql)]
+        if destructive and self._reject_conflicting_work("a write query"):
+            return
         if destructive and not self._confirm("Confirm database changes",
             f"{len(destructive)} statement(s) may change data or schema in {database}. Continue?", True):
             return
         self._sync_config()
         self.run_query_button.configure(state="disabled")
+        self.write_query_active = bool(destructive)
         self.query_status.set(f"Running {len(statements)} statement(s)…")
         def worker():
             last, summaries = None, []
@@ -1786,6 +2213,8 @@ class ModernApp:
         self._thread(worker)
 
     def _query_finished(self, result, count, error):
+        self.write_query_active = False
+        self.last_activity = time.monotonic()
         self.run_query_button.configure(state="normal")
         if error:
             self.query_status.set("Query failed — see Logs")
@@ -1883,6 +2312,8 @@ class ModernApp:
         self._alert("Sanitizer scan failed", error, True)
 
     def start_sanitize(self):
+        if self._reject_conflicting_work("a sanitizer update"):
+            return
         selected = [self.sanitize_columns[index] for index in self.sanitize_list.curselection()]
         database = self.selected_db.get()
         if not selected or not database:
@@ -1905,6 +2336,7 @@ class ModernApp:
         replacement_phone = self.phone_replacement.get()
         replacement_password = DEFAULT_PASSWORD_HASH
         self.sanitize_button.configure(state="disabled")
+        self.sanitize_active = True
         self.sanitize_status.set("Replacing values…")
         def worker():
             errors, completed = [], 0
@@ -1924,6 +2356,8 @@ class ModernApp:
         self._thread(worker)
 
     def _sanitize_finished(self, errors, completed):
+        self.sanitize_active = False
+        self.last_activity = time.monotonic()
         self.sanitize_button.configure(state="normal")
         if errors:
             self.sanitize_status.set(f"Stopped after {completed} confirmed column(s). See Logs.")
@@ -1952,6 +2386,13 @@ class ModernApp:
             self._alert("Settings saved", "Connection settings were saved. The password was not stored.")
 
     def on_close(self):
+        if self.maintenance_operation:
+            self._alert(
+                "Database work in progress",
+                f"Cancel or wait for the active {self.maintenance_operation} before closing the app.",
+                True,
+            )
+            return
         if self.database_copy_active:
             self._alert("Copy in progress", "Wait for the database copy to finish before closing the app.")
             return
@@ -1967,6 +2408,14 @@ class ModernApp:
             self.cancel_button.configure(state="disabled")
             self.importer.cancel()
             self.save_config(notify=False)
+            return
+        active = self._active_database_work()
+        if active:
+            self._alert(
+                "Database work in progress",
+                f"Wait for the active {active} before closing the app.",
+                True,
+            )
             return
         self.save_config(notify=False)
         self.root.destroy()

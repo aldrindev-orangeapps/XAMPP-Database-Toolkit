@@ -6,8 +6,8 @@ from app_ui import NAVIGATION_PAGES
 class NavigationTests(unittest.TestCase):
     def test_primary_workflow_order(self):
         self.assertEqual(
-            ("Databases", "Import", "Sanitizer", "SQL Console"),
-            NAVIGATION_PAGES[:4],
+            ("Databases", "Import", "Backup & Restore", "Sanitizer", "SQL Console"),
+            NAVIGATION_PAGES[:5],
         )
 
     def test_user_manual_is_available(self):
