@@ -51,6 +51,31 @@ class AppUiWorkflowTests(unittest.TestCase):
 
         app._sync_config.assert_not_called()
 
+    def test_server_identity_mismatch_blocks_database_deletion(self):
+        app = ModernApp.__new__(ModernApp)
+        app.importer = None
+        app.import_active = False
+        app.selected_db = Mock()
+        app.selected_db.get.return_value = "customer_data"
+        app._confirm = Mock(return_value=True)
+        app._sync_config = Mock()
+        app._mysql_config = Mock(return_value=MySQLConfig("mysql.exe"))
+        app._set_database_busy = Mock()
+        app.service = Mock()
+        app.service.verify_selected_installation.side_effect = RuntimeError("does not match")
+        app.checkpoints = Mock()
+        app.log = Mock()
+        app._delete_database_finished = Mock()
+        app._ui = lambda callback, *args: callback(*args)
+        app._thread = lambda worker: worker()
+
+        app.delete_database()
+
+        app.service.run.assert_not_called()
+        app._delete_database_finished.assert_called_once_with(
+            "customer_data", "does not match", 0, None,
+        )
+
     def test_database_copy_streams_into_selected_empty_destination(self):
         app = ModernApp.__new__(ModernApp)
         app.importer = None

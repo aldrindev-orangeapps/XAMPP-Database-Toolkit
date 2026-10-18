@@ -12,6 +12,7 @@ A modern Windows desktop tool for importing large SQL dumps, managing local XAMP
 - Database creation, streaming copy, search, selection, and protected deletion
 - Complete streaming backups in `.sql` or `.sql.gz` and controlled restores into empty databases
 - Multi-XAMPP-aware Apache and MySQL controls with exact-installation status and clickable local URLs
+- Named, password-free XAMPP connection profiles and live connected-server identity verification
 - Syntax-highlighted SQL editor with selected-text execution, result tables, affected-row counts, and destructive-query confirmation
 - Email, phone, and password column scanner/sanitizer
 - Connection status, activity logs, cancellation, and clear error reporting
@@ -109,6 +110,7 @@ This local login protects against casual access to the application. The Windows 
 
 - **XAMPP services** uses the official `apache_start.bat`, `apache_stop.bat`, `mysql_start.bat`, and `mysql_stop.bat` scripts found beside the configured `mysql\bin\mysql.exe`. Process status is matched against the exact selected XAMPP installation, so another running XAMPP version is not mistaken for the selected one. Stopping MySQL is blocked while database work is active. Quick links open the local site and phpMyAdmin when their required services are running; a custom Apache `Listen` port is detected automatically.
 - Changing the selected `mysql.exe` checks whether Apache or MySQL from the previous XAMPP installation is still running. The app blocks the switch during active database work and requires an explicit **Switch anyway** confirmation when the previous installation is active or cannot be verified. Switching clears the stale database selection; verify the host and port, test the connection, and refresh databases before continuing.
+- **Connection profiles** save a name, `mysql.exe` path, host, port, and user for each local XAMPP version. Selecting one uses the same previous-installation safety check and clears the in-memory MySQL password. Test connection shows the version, server host/port, `@@basedir`, and `@@datadir` reported by the live server. Before imports, backups, restores, copies, database changes, sanitizer updates, and write queries, the app verifies that the reported base directory belongs to the selected XAMPP installation; this prevents a stale server on the same host/port from receiving the operation.
 - **Copy selected** lets you choose another existing database as the destination, then duplicates the selected source through a bounded-memory `mysqldump.exe` to `mysql.exe` stream. The destination must be empty, so existing data is never overwritten. Create the empty destination with **New database** first.
 - **Delete selected** shows a permanent-deletion warning with a dedicated confirmation button. MySQL system databases are hidden and protected.
 - **SQL Console** runs selected text, or the complete editor if nothing is selected. Writes and schema changes require confirmation. Up to 1,000 result rows are displayed.
@@ -127,7 +129,7 @@ Restore cancellation requires a danger confirmation. If a restore is cancelled o
 
 ## Settings and security
 
-Connection settings are saved in `~/.xampp_sql_importer.ini`; the password is never saved. The password is passed to `mysql.exe` through its child-process environment instead of appearing in command-line arguments.
+Connection settings and named profiles are saved in `~/.xampp_sql_importer.ini`; passwords are never saved in either place. The password is passed to `mysql.exe` through its child-process environment instead of appearing in command-line arguments.
 
 ## Troubleshooting
 
@@ -135,6 +137,7 @@ Connection settings are saved in `~/.xampp_sql_importer.ini`; the password is ne
 |---|---|
 | App cannot find `mysql.exe` | Open **Databases**, browse to the XAMPP MySQL client, and save settings. |
 | Connection fails | Start MySQL in XAMPP and verify host, port, user, and password. |
+| Selected XAMPP does not match the connected server | Stop the older MySQL service, or select the profile and port whose displayed server base directory matches its XAMPP folder. |
 | A statement exceeds `max_allowed_packet` | Follow the displayed `my.ini` instruction, restart MySQL, then resume. |
 | Import pauses after a disconnect | Review the shown statement. Retry may duplicate it; skip only if you know it committed. |
 | Database copy is rejected | Create or select an empty destination database; Copy never overwrites existing objects. |

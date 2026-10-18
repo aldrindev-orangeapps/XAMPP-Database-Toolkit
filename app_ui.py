@@ -16,12 +16,14 @@ import webbrowser
 from tkinter import filedialog, simpledialog, ttk
 
 from checkpoints import CheckpointStore, checkpoint_key
-from importer import ResumableImporter
+from connection_profiles import ConnectionProfile, add_profiles_to_config, profiles_from_config
+from importer import ImportResult, ResumableImporter
 from local_auth import AuthError, LocalAuth
 from mysql_service import (
     DatabaseOperationCancelled,
     MySQLConfig,
     MySQLService,
+    ServerIdentity,
     SYSTEM_DATABASES,
 )
 from sql_parser import is_read_only_sql, split_sql_text
@@ -269,6 +271,12 @@ class ModernApp:
 
         self.mysql_path, self.host, self.port = tk.StringVar(), tk.StringVar(value="127.0.0.1"), tk.StringVar(value="3306")
         self.user, self.password = tk.StringVar(value="root"), tk.StringVar()
+        self.profile_name = tk.StringVar()
+        self.connection_profiles: dict[str, ConnectionProfile] = {}
+        self.server_identity_status = tk.StringVar(value="Not verified")
+        self.server_identity_detail = tk.StringVar(
+            value="Test the connection to verify which XAMPP installation is serving this port."
+        )
         self.selected_db, self.sql_file = tk.StringVar(), tk.StringVar()
         self.continue_on_error = tk.BooleanVar(value=True)
         self.connection_text, self.search_db = tk.StringVar(value="Not connected"), tk.StringVar()
@@ -324,6 +332,8 @@ class ModernApp:
         self.checkpoints = CheckpointStore()
         self._configure_style()
         self._build_shell()
+        for variable in (self.mysql_path, self.host, self.port, self.user):
+            variable.trace_add("write", self._connection_settings_changed)
         self.app_shell.grid_remove()
         self._show_auth_screen()
         root.bind_all("<KeyPress>", self._record_activity, add="+")
@@ -868,23 +878,41 @@ class ModernApp:
         grid.pack(fill="x", pady=(10, 0))
         for column in (1, 3, 5, 7):
             grid.columnconfigure(column, weight=1)
-        ttk.Label(grid, text="mysql.exe", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(grid, text="Profile", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.profile_box = ttk.Combobox(grid, textvariable=self.profile_name, state="readonly")
+        self.profile_box.grid(row=0, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=4)
+        self.profile_box.configure(values=sorted(self.connection_profiles, key=str.casefold))
+        self.profile_box.bind("<<ComboboxSelected>>", self._select_connection_profile)
+        ttk.Button(grid, text="Save profile", command=self.save_connection_profile).grid(row=0, column=5, padx=(0, 8), pady=4)
+        ttk.Button(grid, text="Delete profile", command=self.delete_connection_profile).grid(row=0, column=6, columnspan=2, sticky="e", pady=4)
+        ttk.Label(grid, text="mysql.exe", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         self.mysql_path_entry = ttk.Entry(grid, textvariable=self.mysql_path)
-        self.mysql_path_entry.grid(row=0, column=1, columnspan=6, sticky="ew", padx=(0, 8), pady=4)
+        self.mysql_path_entry.grid(row=1, column=1, columnspan=6, sticky="ew", padx=(0, 8), pady=4)
         self.mysql_path_entry.bind("<FocusOut>", self._apply_manual_mysql_path)
         self.mysql_path_entry.bind("<Return>", self._apply_manual_mysql_path)
-        ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=0, column=7, sticky="e", pady=4)
+        ttk.Button(grid, text="Browse", command=self.browse_mysql).grid(row=1, column=7, sticky="e", pady=4)
         compact_fields = (("Host", self.host, ""), ("Port", self.port, ""),
                           ("User", self.user, ""), ("Password", self.password, "*"))
         for index, (label, variable, mask) in enumerate(compact_fields):
             column = index * 2
-            ttk.Label(grid, text=label, style="Muted.TLabel").grid(row=1, column=column, sticky="w", padx=(0, 6), pady=4)
-            ttk.Entry(grid, textvariable=variable, show=mask).grid(row=1, column=column + 1, sticky="ew", padx=(0, 12), pady=4)
+            ttk.Label(grid, text=label, style="Muted.TLabel").grid(row=2, column=column, sticky="w", padx=(0, 6), pady=4)
+            ttk.Entry(grid, textvariable=variable, show=mask).grid(row=2, column=column + 1, sticky="ew", padx=(0, 12), pady=4)
         actions = ttk.Frame(conn, style="Card.TFrame")
         actions.pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Change app password", command=self.change_app_password).pack(side="left")
         ttk.Button(actions, text="Save settings", command=self.save_config).pack(side="right")
         ttk.Button(actions, text="Test connection", style="Primary.TButton", command=self.test_connection).pack(side="right", padx=8)
+        identity = self._card(
+            body, "Connected server identity",
+            "Live values reported by the server, not inferred from the selected mysql.exe.",
+            padding=16, subtitle_gap=6,
+        )
+        identity.pack(fill="x", pady=(14, 0))
+        ttk.Label(identity, textvariable=self.server_identity_status, style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(
+            identity, textvariable=self.server_identity_detail, style="Muted.TLabel",
+            wraplength=860, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
         services = self._card(
             body, "XAMPP services",
             "Start or stop the local services using the official scripts in the selected XAMPP folder.",
@@ -1158,7 +1186,11 @@ class ModernApp:
                 "and Start/Stop actions apply to the installation containing the selected mysql.exe. Each running "
                 "installation must use its own Apache and MySQL ports. When mysql.exe is changed, the app checks the "
                 "previous installation and warns if its Apache or MySQL is still running. A switch clears the stale "
-                "database selection; verify the host and port before refreshing.\n\n"
+                "database selection; verify the host and port before refreshing. Save profile stores a named set of "
+                "mysql.exe, host, port, and user values for one-click switching; passwords are never stored. Test "
+                "connection displays the server-reported version, host, port, base directory, and data directory. "
+                "The app blocks transfers and database changes if that base directory does not match the selected "
+                "XAMPP installation.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
                 "Copy selected duplicates the selected source into an existing empty destination database. "
                 "Delete selected permanently removes the selected database after you confirm the warning. "
@@ -1441,6 +1473,7 @@ class ModernApp:
         def worker():
             size, error, was_cancelled = 0, None, False
             try:
+                self._verify_selected_server()
                 size = self.service.backup_database(
                     database, output_path, compressed, progress, self.maintenance_cancel,
                 )
@@ -1534,6 +1567,7 @@ class ModernApp:
         def worker():
             result, error, was_cancelled = None, None, False
             try:
+                self._verify_selected_server()
                 result = self.service.restore_database(
                     backup_path, destination, progress, self.maintenance_cancel,
                 )
@@ -1592,6 +1626,86 @@ class ModernApp:
         if path:
             self._request_mysql_path_switch(path)
 
+    def _select_connection_profile(self, _event=None):
+        name = self.profile_name.get()
+        profile = self.connection_profiles.get(name)
+        if not profile:
+            return
+        previous_name = getattr(self, "active_profile_name", "")
+        self.profile_name.set(previous_name)
+
+        def apply_profile():
+            self.host.set(profile.host)
+            self.port.set(profile.port)
+            self.user.set(profile.user)
+            self.password.set("")
+            self.profile_name.set(name)
+            self.active_profile_name = name
+            self._sync_config()
+            self._clear_server_identity()
+            self.log(f"Selected connection profile: {name}. Enter its password, then test the connection.")
+
+        self._request_mysql_path_switch(profile.mysql_path, apply_profile)
+
+    def save_connection_profile(self):
+        initial = self.profile_name.get() or "Default"
+        name = simpledialog.askstring(
+            "Save connection profile", "Profile name:", initialvalue=initial, parent=self.root,
+        )
+        if not name:
+            return
+        name = name.strip()
+        if not name or any(character in name for character in "[]\r\n"):
+            self._alert("Invalid profile name", "Use a name without brackets or line breaks.", True)
+            return
+        self.connection_profiles[name] = ConnectionProfile(
+            name, self.mysql_path.get().strip(), self.host.get().strip(),
+            self.port.get().strip(), self.user.get().strip(),
+        )
+        self.profile_name.set(name)
+        self.active_profile_name = name
+        self.profile_box.configure(values=sorted(self.connection_profiles, key=str.casefold))
+        self.save_config(notify=False)
+        self._alert("Profile saved", f"Saved {name}. Its MySQL password was not stored.")
+
+    def delete_connection_profile(self):
+        name = self.profile_name.get()
+        if not name or name not in self.connection_profiles:
+            self._alert("No profile", "Select a saved profile first.")
+            return
+        if not self._confirm("Delete profile", f"Delete the saved profile '{name}'?", True, "Delete profile"):
+            return
+        del self.connection_profiles[name]
+        self.profile_name.set("")
+        self.active_profile_name = ""
+        self.profile_box.configure(values=sorted(self.connection_profiles, key=str.casefold))
+        self.save_config(notify=False)
+
+    def _clear_server_identity(self):
+        if not hasattr(self, "server_identity_status"):
+            return
+        self.server_identity_status.set("Not verified")
+        self.server_identity_detail.set(
+            "Test the connection to verify which XAMPP installation is serving this port."
+        )
+
+    def _connection_settings_changed(self, *_args):
+        self._clear_server_identity()
+        self._set_connection(False, "Not verified")
+
+    def _show_server_identity(self, identity: ServerIdentity):
+        self.server_identity_status.set(f"Verified match · MySQL/MariaDB {identity.version}")
+        self.server_identity_detail.set(
+            f"Server {identity.hostname}:{identity.port}  ·  base {identity.base_directory}  ·  "
+            f"data {identity.data_directory}"
+        )
+
+    def _verify_selected_server(self):
+        identity = self.service.verify_selected_installation()
+        if isinstance(identity, ServerIdentity):
+            self._ui(self._show_server_identity, identity)
+        return identity
+
     def _apply_manual_mysql_path(self, _event=None):
         candidate = self.mysql_path.get().strip()
         accepted = getattr(self, "accepted_mysql_path", "")
@@ -1600,7 +1714,7 @@ class ModernApp:
         self.mysql_path.set(accepted)
         self._request_mysql_path_switch(candidate)
 
-    def _request_mysql_path_switch(self, candidate):
+    def _request_mysql_path_switch(self, candidate, on_accepted=None):
         """Validate a new XAMPP path and check the previous installation before switching."""
         accepted = getattr(self, "accepted_mysql_path", self.mysql_path.get().strip())
         self.mysql_path.set(accepted)
@@ -1620,10 +1734,10 @@ class ModernApp:
         except Exception:
             accepted_root = None
         if accepted_root and os.path.normcase(accepted_root) == os.path.normcase(candidate_root):
-            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None)
+            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None, on_accepted)
             return
         if not accepted_root:
-            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None)
+            self._finish_mysql_path_switch(candidate, accepted, candidate_root, [], None, on_accepted)
             return
 
         self.xampp_switch_pending = True
@@ -1647,11 +1761,12 @@ class ModernApp:
                 candidate_root,
                 running,
                 error,
+                on_accepted,
             )
 
         self._thread(worker)
 
-    def _finish_mysql_path_switch(self, candidate, accepted, candidate_root, running, error):
+    def _finish_mysql_path_switch(self, candidate, accepted, candidate_root, running, error, on_accepted=None):
         self.xampp_switch_pending = False
         warning = None
         if error:
@@ -1683,9 +1798,12 @@ class ModernApp:
         self.databases = []
         self._filter_databases()
         self._set_connection(False, "Verify host and port")
+        self._clear_server_identity()
         self.database_status.set("Refresh databases after verifying the connection")
         self.log(f"Selected XAMPP installation: {candidate_root}")
         self.refresh_xampp_services()
+        if on_accepted:
+            on_accepted()
 
     def refresh_xampp_services(self, notify=False):
         try:
@@ -1858,10 +1976,14 @@ class ModernApp:
         self.connection_text.set("Connecting…")
         def worker():
             try:
-                elapsed = self.service.ping()
+                started = time.monotonic()
+                identity = self.service.verify_selected_installation()
+                elapsed = time.monotonic() - started
+                self._ui(self._show_server_identity, identity)
                 self._ui(self._set_connection, True, f"Connected • {elapsed * 1000:.0f} ms")
                 self.log("Connection test succeeded.")
             except Exception as exc:
+                self._ui(self._clear_server_identity)
                 self._ui(self._set_connection, False, "Connection failed")
                 self._ui(self._alert, "Connection failed", str(exc), True)
         self._thread(worker)
@@ -1874,6 +1996,7 @@ class ModernApp:
             self._ui(self.connection_text.set, f"Retry {attempt}/5 in {delay}s")
         def worker():
             try:
+                self._verify_selected_server()
                 self.databases = self.service.databases(retry_callback=retry)
                 self._ui(self._filter_databases)
                 self._ui(self._set_connection, True, "Connected")
@@ -1882,6 +2005,7 @@ class ModernApp:
                     self._ui(self.selected_db.set, self.databases[0])
                 self.log(f"Loaded {len(self.databases)} database(s).")
             except Exception as exc:
+                self._ui(self._clear_server_identity)
                 self._ui(self._set_connection, False, "Connection failed")
                 self._ui(self.database_status.set, "Refresh failed")
                 self.log(f"Database refresh failed: {exc}")
@@ -1941,6 +2065,7 @@ class ModernApp:
         self._sync_config()
         def worker():
             try:
+                self._verify_selected_server()
                 self.service.run(["-e", f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4;"])
                 self.log(f"Created database: {name}")
                 self._ui(self.selected_db.set, name)
@@ -1971,6 +2096,7 @@ class ModernApp:
         self._set_database_busy(True, f"Deleting {name}…")
         def worker():
             try:
+                self._verify_selected_server()
                 quoted_name = name.replace("`", "``")
                 self.service.run(["-e", f"DROP DATABASE `{quoted_name}`;"])
             except Exception as exc:
@@ -2013,6 +2139,7 @@ class ModernApp:
         def worker():
             copy_started = False
             try:
+                self._verify_selected_server()
                 if not self.service.database_is_empty(destination):
                     self._ui(
                         self._copy_database_finished,
@@ -2234,7 +2361,12 @@ class ModernApp:
 
         self.importer = ResumableImporter(self.service, self.checkpoints, progress, self.log, ambiguous, self.import_cancel)
         def worker():
-            self._ui(self._import_finished, self.importer.run(path, database, continue_on_error))
+            try:
+                self._verify_selected_server()
+                result = self.importer.run(path, database, continue_on_error)
+            except Exception as exc:
+                result = ImportResult(False, message=str(exc))
+            self._ui(self._import_finished, result)
         self._thread(worker)
 
     def cancel_import(self):
@@ -2302,6 +2434,8 @@ class ModernApp:
         def worker():
             last, summaries = None, []
             try:
+                if destructive:
+                    self._verify_selected_server()
                 for index, statement in enumerate(statements, 1):
                     result = self.service.execute_query(statement, database, is_read_only_sql(statement))
                     last = result
@@ -2442,6 +2576,11 @@ class ModernApp:
         self.sanitize_status.set("Replacing values…")
         def worker():
             errors, completed = [], 0
+            try:
+                self._verify_selected_server()
+            except Exception as exc:
+                self._ui(self._sanitize_finished, [str(exc)], completed)
+                return
             for index, (table, column, kind) in enumerate(selected, 1):
                 values = {"email": replacement_email, "phone": replacement_phone, "password": replacement_password}
                 query = build_sanitize_query(table, column, kind, values[kind])
@@ -2470,18 +2609,37 @@ class ModernApp:
 
     def _load_config(self):
         config = configparser.ConfigParser()
+        self.active_profile_name = ""
         if os.path.isfile(CONFIG_FILE):
             config.read(CONFIG_FILE)
+            self.connection_profiles = profiles_from_config(config)
             if "settings" in config:
                 values = config["settings"]
                 self.mysql_path.set(values.get("mysql_path", ""))
                 self.host.set(values.get("host", "127.0.0.1"))
                 self.port.set(values.get("port", "3306"))
                 self.user.set(values.get("user", "root"))
+                active = values.get("active_profile", "")
+                if active in self.connection_profiles:
+                    self.active_profile_name = active
+                    self.profile_name.set(active)
 
     def save_config(self, notify=True):
         config = configparser.ConfigParser()
-        config["settings"] = {"mysql_path": self.mysql_path.get(), "host": self.host.get(), "port": self.port.get(), "user": self.user.get()}
+        active_profile = ""
+        selected_profile = self.connection_profiles.get(self.profile_name.get())
+        if selected_profile and selected_profile == ConnectionProfile(
+            selected_profile.name,
+            self.mysql_path.get().strip(), self.host.get().strip(),
+            self.port.get().strip(), self.user.get().strip(),
+        ):
+            active_profile = selected_profile.name
+        config["settings"] = {
+            "mysql_path": self.mysql_path.get(), "host": self.host.get(),
+            "port": self.port.get(), "user": self.user.get(),
+            "active_profile": active_profile,
+        }
+        add_profiles_to_config(config, self.connection_profiles)
         with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
             config.write(handle)
         if notify:

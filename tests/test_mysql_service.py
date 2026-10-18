@@ -41,6 +41,34 @@ class FakeProcess:
 
 
 class MySQLServiceCopyTests(unittest.TestCase):
+    def test_server_identity_verifies_selected_xampp_base_directory(self):
+        config = MySQLConfig(r"C:\xampp-8.0\mysql\bin\mysql.exe", password="secret")
+        service = MySQLService(lambda: config)
+        service.config = Mock(return_value=config)
+        service.run = Mock()
+        service.run.return_value.stdout = (
+            "10.4.32-MariaDB\tDEV-PC\t3306\tC:/xampp-8.0/mysql/\tC:/xampp-8.0/mysql/data/\n"
+        )
+
+        identity = service.verify_selected_installation()
+
+        self.assertEqual("10.4.32-MariaDB", identity.version)
+        self.assertEqual(r"C:/xampp-8.0/mysql/", identity.base_directory)
+        self.assertIn("--raw", service.run.call_args.args[0])
+        self.assertNotIn("secret", service.run.call_args.args[0])
+
+    def test_server_identity_rejects_a_different_running_xampp(self):
+        config = MySQLConfig(r"C:\xampp-8.0\mysql\bin\mysql.exe")
+        service = MySQLService(lambda: config)
+        service.config = Mock(return_value=config)
+        service.run = Mock()
+        service.run.return_value.stdout = (
+            "5.6.40\tDEV-PC\t3306\tC:/xampp-5.6/mysql/\tC:/xampp-5.6/mysql/data/\n"
+        )
+
+        with self.assertRaisesRegex(MySQLError, "does not match"):
+            service.verify_selected_installation()
+
     def test_database_is_empty_counts_all_schema_objects_with_hex_name(self):
         config = MySQLConfig("mysql.exe")
         service = MySQLService(lambda: config)

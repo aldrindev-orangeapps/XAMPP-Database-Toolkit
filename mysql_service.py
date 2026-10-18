@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import ntpath
 import os
 import subprocess
 import tempfile
@@ -43,6 +44,15 @@ class QueryResult:
     elapsed: float
     truncated: bool = False
     stderr: str = ""
+
+
+@dataclass(frozen=True)
+class ServerIdentity:
+    version: str
+    hostname: str
+    port: str
+    base_directory: str
+    data_directory: str
 
 
 class BackupMetadata(TypedDict):
@@ -135,6 +145,34 @@ class MySQLService:
         started = time.monotonic()
         self.run(["-N", "-B", "-e", "SELECT 1;"], timeout=12, safe_retry=False)
         return time.monotonic() - started
+
+    def server_identity(self) -> ServerIdentity:
+        """Read the identity of the server reached by the configured host and port."""
+        result = self.run(
+            ["-N", "-B", "--raw", "-e", "SELECT VERSION(), @@hostname, @@port, @@basedir, @@datadir;"],
+            timeout=12,
+        )
+        values = result.stdout.rstrip("\r\n").split("\t")
+        if len(values) != 5 or not all(values):
+            raise MySQLError("MySQL returned an incomplete server identity.")
+        return ServerIdentity(*values)
+
+    @staticmethod
+    def _windows_path_key(path: str) -> str:
+        return ntpath.normcase(ntpath.normpath(path.replace("/", "\\").strip()))
+
+    def verify_selected_installation(self) -> ServerIdentity:
+        """Ensure the selected XAMPP client belongs to the reached local server."""
+        cfg = self.config()
+        identity = self.server_identity()
+        selected_base = ntpath.dirname(ntpath.dirname(cfg.executable))
+        if self._windows_path_key(selected_base) != self._windows_path_key(identity.base_directory):
+            raise MySQLError(
+                "The selected XAMPP installation does not match the connected MySQL server. "
+                f"Selected: {selected_base}. Connected server base directory: "
+                f"{identity.base_directory}. Stop the previous MySQL service or correct the host and port."
+            )
+        return identity
 
     def databases(self, retry_callback=None) -> list[str]:
         result = self.run(
