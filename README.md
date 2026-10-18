@@ -109,7 +109,7 @@ This local login protects against casual access to the application. The Windows 
 
 The app writes to a temporary file beside the selected destination and atomically replaces that destination only after `mysqldump.exe` succeeds. Cancelling or failing removes the temporary file and preserves any older backup at the same path.
 
-**Restore toolkit backup** accepts only marked `.sql` and `.sql.gz` files created by this toolkit. Select an existing destination database with no tables, views, routines, or events. Restore streams directly into `mysql.exe`; it does not create an import checkpoint and its byte progress must not be interpreted as statement-confirmed progress.
+**Restore toolkit backup** accepts only marked `.sql` and `.sql.gz` files created by this toolkit. Select an existing destination database with no tables, views, routines, or events. The restore stream remaps mysqldump's quoted source-schema references to the selected destination, so the database name may differ from the original. Restore streams directly into `mysql.exe`; it does not create an import checkpoint and its byte progress must not be interpreted as statement-confirmed progress.
 
 Restore cancellation requires a danger confirmation. If a restore is cancelled or fails after starting, treat the destination as potentially partial: delete it, create a fresh empty database, and retry the restore. Database creation remains a separate **New database** action.
 

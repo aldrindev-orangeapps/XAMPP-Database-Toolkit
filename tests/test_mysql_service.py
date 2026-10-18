@@ -109,7 +109,9 @@ class MySQLServiceBackupRestoreTests(unittest.TestCase):
         self.assertIn(b"XAMPP_DATABASE_TOOLKIT_BACKUP", content)
         self.assertIn(b'"source_database":"source_db"', content)
         self.assertTrue(content.endswith(b"CREATE TABLE t (id int);\n"))
-        for option in ("--routines", "--events", "--triggers", "--single-transaction", "--quick"):
+        for option in (
+            "--routines", "--events", "--triggers", "--single-transaction", "--quick", "--quote-names",
+        ):
             self.assertIn(option, command)
         self.assertNotIn("secret-password", command)
         self.assertEqual("secret-password", popen.call_args.kwargs["env"]["MYSQL_PWD"])
@@ -230,6 +232,27 @@ class MySQLServiceBackupRestoreTests(unittest.TestCase):
             self._write_backup(path)
             with self.assertRaises(DatabaseOperationCancelled):
                 self.service.restore_database(path, "empty_db", cancelled=cancelled)
+
+    @patch("mysql_service.STREAM_CHUNK_SIZE", 7)
+    @patch("mysql_service.subprocess.Popen")
+    def test_restore_remaps_quoted_source_schema_across_chunk_boundaries(self, popen):
+        self.service.database_is_empty = Mock(return_value=True)
+        process = FakeProcess(with_stdin=True)
+        popen.return_value = process
+        sql = (
+            b"CREATE VIEW `report` AS SELECT `source_db`.`orders`.`id` "
+            b"FROM `source_db`.`orders`;\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "backup.sql")
+            with open(path, "wb") as handle:
+                handle.write(self.service._backup_header("source_db") + sql)
+
+            self.service.restore_database(path, "restored_db")
+
+        restored = process.stdin.getvalue()
+        self.assertNotIn(b"`source_db`.", restored)
+        self.assertEqual(2, restored.count(b"`restored_db`."))
 
     @patch("mysql_service.subprocess.Popen")
     @patch("mysql_service.os.path.isfile", return_value=True)

@@ -276,6 +276,7 @@ class MySQLService:
             "--routines",
             "--events",
             "--triggers",
+            "--quote-names",
             "--hex-blob",
             "--",
             database,
@@ -365,6 +366,12 @@ class MySQLService:
             raise MySQLError("The destination database is not empty. Choose an empty database.")
         total = os.path.getsize(backup_path)
         compressed = backup_path.casefold().endswith(".gz")
+        source_prefix = (
+            "`" + metadata["source_database"].replace("`", "``") + "`."
+        ).encode("utf-8")
+        destination_prefix = (
+            "`" + destination.replace("`", "``") + "`."
+        ).encode("utf-8")
         command, environment = self.command(destination)
         process = subprocess.Popen(
             command,
@@ -394,15 +401,41 @@ class MySQLService:
                 stream = gzip.GzipFile(fileobj=raw, mode="rb") if compressed else raw
                 try:
                     self._read_backup_header(stream)
+                    pending = b""
                     while True:
                         if cancellation.is_set():
                             raise DatabaseOperationCancelled("Restore cancelled.")
                         chunk = stream.read(STREAM_CHUNK_SIZE)
                         if not chunk:
                             break
-                        process.stdin.write(chunk)
+                        pending += chunk
+                        if source_prefix != destination_prefix:
+                            safe_start = len(pending) - len(source_prefix)
+                            if safe_start < 0:
+                                continue
+                            output = bytearray()
+                            cursor = 0
+                            while True:
+                                match = pending.find(source_prefix, cursor)
+                                if match < 0 or match > safe_start:
+                                    break
+                                output.extend(pending[cursor:match])
+                                output.extend(destination_prefix)
+                                cursor = match + len(source_prefix)
+                            cutoff = max(cursor, safe_start + 1)
+                            output.extend(pending[cursor:cutoff])
+                            process.stdin.write(output)
+                            pending = pending[cutoff:]
+                        else:
+                            process.stdin.write(pending)
+                            pending = b""
                         if progress:
                             progress(min(raw.tell(), total), total)
+                    if pending:
+                        process.stdin.write(
+                            pending.replace(source_prefix, destination_prefix)
+                            if source_prefix != destination_prefix else pending
+                        )
                 finally:
                     if compressed:
                         stream.close()

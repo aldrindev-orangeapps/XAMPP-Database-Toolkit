@@ -1173,7 +1173,8 @@ class ModernApp:
                 "failed or cancelled backup preserves any older file.\n\n"
                 "Restore accepts toolkit-created backups only and streams directly into an existing database that "
                 "has no tables, views, routines, or events. Restore progress is bytes transmitted, not confirmed "
-                "statements, and cannot be resumed. If restore fails or is cancelled, delete and recreate the "
+                "statements, and cannot be resumed. Quoted references to the original schema are remapped to the "
+                "selected destination, so its database name may be different. If restore fails or is cancelled, delete and recreate the "
                 "potentially partial destination before trying again.",
             ),
             (
