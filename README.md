@@ -44,9 +44,20 @@ python -m PyInstaller --noconfirm ".\XAMPP Database Toolkit.spec"
 
 The result is written to `dist\XAMPP Database Toolkit.exe`.
 
+### Build the Windows installer
+
+Install [NSIS](https://nsis.sourceforge.io/) once, then run:
+
+```powershell
+winget install --id NSIS.NSIS -e
+.\scripts\build_installer.ps1 -Version "1.1.0-local" -SkipAppBuild
+```
+
+Remove `-SkipAppBuild` when the portable EXE also needs to be rebuilt. The installer is written directly to `dist`, installs for the current Windows user without an administrator prompt, adds Start Menu shortcuts, offers an optional desktop shortcut, and registers a standard uninstaller under Windows Installed Apps. Application settings, authentication data, checkpoints, and database backups are not bundled into or removed by the installer.
+
 ## Publish a GitHub release
 
-The `Build Windows release` GitHub Actions workflow runs whenever a tag beginning with `v` is pushed. It runs the complete test suite on Windows, builds the canonical PyInstaller spec, and publishes the EXE, a versioned ZIP package, and `SHA256SUMS.txt` on the matching GitHub Release.
+The `Build Windows release` GitHub Actions workflow runs whenever a tag beginning with `v` is pushed. It runs the complete test suite on Windows, builds the canonical PyInstaller spec and NSIS installer, and publishes the installer, portable EXE, versioned ZIP package, and `SHA256SUMS.txt` on the matching GitHub Release.
 
 Commit and push the source changes before creating a release tag:
 

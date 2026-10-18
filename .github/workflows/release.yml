@@ -35,6 +35,18 @@ jobs:
         shell: pwsh
         run: python -m PyInstaller --noconfirm ".\XAMPP Database Toolkit.spec"
 
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          .\scripts\build_installer.ps1 -Version $version -SkipAppBuild
+
       - name: Package release files
         id: package
         shell: pwsh
@@ -47,16 +59,22 @@ jobs:
           }
 
           $safeTag = $env:RELEASE_TAG -replace "[^A-Za-z0-9._-]", "-"
+          $version = $env:RELEASE_TAG -replace '^v', ''
           $zip = "dist\XAMPP-Database-Toolkit-$safeTag-windows-x64.zip"
+          $installer = "dist\XAMPP-Database-Toolkit-$version-Setup.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Expected installer was not found: $installer"
+          }
           Compress-Archive -LiteralPath $exe -DestinationPath $zip -Force
 
-          $checksumFiles = @($exe, $zip)
+          $checksumFiles = @($exe, $zip, $installer)
           $checksums = foreach ($file in $checksumFiles) {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))"
           }
           $checksums | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
           "zip_path=$zip" >> $env:GITHUB_OUTPUT
+          "installer_path=$installer" >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub release
         shell: pwsh
@@ -64,10 +82,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
           ZIP_PATH: ${{ steps.package.outputs.zip_path }}
+          INSTALLER_PATH: ${{ steps.package.outputs.installer_path }}
         run: |
           $assets = @(
             "dist\XAMPP Database Toolkit.exe",
             $env:ZIP_PATH,
+            $env:INSTALLER_PATH,
             "dist\SHA256SUMS.txt"
           )
 
