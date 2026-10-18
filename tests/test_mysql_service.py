@@ -93,6 +93,7 @@ class MySQLServiceBackupRestoreTests(unittest.TestCase):
             "127.0.0.1", "3307", "admin", "secret-password",
         )
         self.service = MySQLService(lambda: self.config)
+        self.service.config = Mock(return_value=self.config)
 
     @patch("mysql_service.subprocess.Popen")
     @patch("mysql_service.os.path.isfile", return_value=True)
