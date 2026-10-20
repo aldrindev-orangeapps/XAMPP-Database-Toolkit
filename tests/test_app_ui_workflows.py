@@ -10,6 +10,34 @@ class AppUiWorkflowTests(unittest.TestCase):
     def test_backup_restore_navigation_follows_import(self):
         self.assertEqual(("Databases", "Import", "Backup & Restore"), NAVIGATION_PAGES[:3])
 
+    def test_selected_database_name_is_copied_from_header_badge(self):
+        app = ModernApp.__new__(ModernApp)
+        app.selected_db = Mock()
+        app.selected_db.get.return_value = "client_archive"
+        app.root = Mock()
+        app.database_badge = Mock()
+
+        app.copy_selected_database_name()
+
+        app.root.clipboard_clear.assert_called_once_with()
+        app.root.clipboard_append.assert_called_once_with("client_archive")
+        app.database_badge.configure.assert_called_once_with(text="Copied: client_archive")
+        app.root.after.assert_called_once_with(1_500, app._update_database_badge)
+
+    def test_database_badge_click_does_nothing_without_selection(self):
+        app = ModernApp.__new__(ModernApp)
+        app.selected_db = Mock()
+        app.selected_db.get.return_value = ""
+        app.root = Mock()
+        app.database_badge = Mock()
+
+        app.copy_selected_database_name()
+
+        app.root.clipboard_clear.assert_not_called()
+        app.root.clipboard_append.assert_not_called()
+        app.database_badge.configure.assert_not_called()
+        app.root.after.assert_not_called()
+
     def test_database_deletion_uses_confirmation_button_and_quotes_name(self):
         app = ModernApp.__new__(ModernApp)
         app.importer = None

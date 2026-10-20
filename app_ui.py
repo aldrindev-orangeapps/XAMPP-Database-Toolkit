@@ -636,8 +636,10 @@ class ModernApp:
                                          font=(self.font_family, 9, "bold"), padx=12, pady=6)
         self.connection_badge.pack(side="right", padx=(8, 0))
         self.database_badge = tk.Label(header, text="No database selected", bg="#EEF2FF", fg=PRIMARY,
-                                       font=(self.font_family, 9, "bold"), padx=12, pady=6)
+                                       font=(self.font_family, 9, "bold"), padx=12, pady=6,
+                                       cursor="arrow")
         self.database_badge.pack(side="right")
+        self.database_badge.bind("<Button-1>", self.copy_selected_database_name)
         self.page_host = tk.Frame(main, bg=BG)
         self.page_host.grid(row=1, column=0, sticky="nsew")
         self.page_host.grid_rowconfigure(0, weight=1)
@@ -660,7 +662,24 @@ class ModernApp:
         self._build_sanitize_page()
         self._build_logs_page()
         self._build_manual_page()
-        self.selected_db.trace_add("write", lambda *_: self.database_badge.configure(text=self.selected_db.get() or "No database selected"))
+        self.selected_db.trace_add("write", self._update_database_badge)
+
+    def _update_database_badge(self, *_args):
+        database = self.selected_db.get()
+        self.database_badge.configure(
+            text=database or "No database selected",
+            cursor="hand2" if database else "arrow",
+        )
+
+    def copy_selected_database_name(self, _event=None):
+        """Copy the active database name when its header badge is clicked."""
+        database = self.selected_db.get()
+        if not database:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(database)
+        self.database_badge.configure(text=f"Copied: {database}")
+        self.root.after(1_500, self._update_database_badge)
 
     def _new_page(self, name):
         page = tk.Frame(self.page_host, bg=BG)
@@ -1192,6 +1211,7 @@ class ModernApp:
                 "The app blocks transfers and database changes if that base directory does not match the selected "
                 "XAMPP installation.\n\n"
                 "Refresh loads databases from the server. New database creates an empty UTF-8 database. "
+                "Click the selected database name in the top header to copy it to the clipboard. "
                 "Copy selected duplicates the selected source into an existing empty destination database. "
                 "Delete selected permanently removes the selected database after you confirm the warning. "
                 "MySQL cannot be stopped while database work is active.",
